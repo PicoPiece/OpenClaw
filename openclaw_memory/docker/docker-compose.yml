@@ -1,0 +1,74 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+  app:
+    build:
+      context: ../
+      dockerfile: openclaw_memory/docker/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      AI_STUDIO_API_KEY: "${AI_STUDIO_API_KEY}"
+      REDIS_URL: "redis://redis:6379/0"
+      QDRANT_URL: "http://qdrant:6333"
+      OLLAMA_URL: "http://ollama:11434"
+      MAX_PROMPT_TOKENS: "8000"
+      SLIDING_WINDOW_SIZE: "10"
+      SUMMARIZE_THRESHOLD_TOKENS: "20000"
+      RATE_LIMIT_RPM: "30"
+      RATE_LIMIT_TPM: "32000"
+    ports:
+      - "127.0.0.1:8100:8100"
+
+  worker:
+    build:
+      context: ../
+      dockerfile: openclaw_memory/docker/Dockerfile
+    command: ["python", "-c", "from openclaw_memory.queue_worker import QueueWorker; from openclaw_memory.config import load_settings; QueueWorker(load_settings()).start()"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      AI_STUDIO_API_KEY: "${AI_STUDIO_API_KEY}"
+      REDIS_URL: "redis://redis:6379/0"
+      QDRANT_URL: "http://qdrant:6333"
+      OLLAMA_URL: "http://ollama:11434"
+
+volumes:
+  redis-data:
+  qdrant-data:
+  ollama-data:

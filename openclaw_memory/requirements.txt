@@ -1,0 +1,8 @@
+pyyaml>=6.0
+requests>=2.31
+redis>=5.0
+qdrant-client>=1.9
+fastapi>=0.110
+uvicorn>=0.29
+pytest>=8.0
+pytest-mock>=3.12

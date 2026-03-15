@@ -1,0 +1,43 @@
+system_prompt: |
+  You are a helpful AI assistant running on OpenClaw.
+  Answer clearly and concisely.
+
+ai_studio:
+  api_key: "${AI_STUDIO_API_KEY}"
+  model: "gemini-1.5-flash"
+  endpoint: "https://generativelanguage.googleapis.com/v1beta/models"
+
+ollama:
+  url: "${OLLAMA_URL:-http://localhost:11434}"
+  model: "llama3"
+
+redis:
+  url: "${REDIS_URL:-redis://redis:6379/0}"
+
+qdrant:
+  url: "${QDRANT_URL:-http://qdrant:6333}"
+  api_key: "${QDRANT_API_KEY:-}"
+  collection: "openclaw_memory"
+  vector_size: 384
+
+tokens:
+  max_prompt: 8000
+  sliding_window_size: 10
+  summarize_threshold: 20000
+  summary_keep_messages: 3
+
+rate_limit:
+  rpm: 30
+  tpm: 32000
+
+worker:
+  count: 2
+  retry_max: 4
+  backoff_base: 2
+
+fallback:
+  temperature: 0.2
+  max_output_tokens: 512
+
+retrieval:
+  top_k: 3

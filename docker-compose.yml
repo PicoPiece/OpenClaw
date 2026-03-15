@@ -1,0 +1,44 @@
+services:
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:18789:18789"
+
+    user: "1000:1000"
+    read_only: true
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./data:/home/node/.openclaw
+
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18789/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
