@@ -9,7 +9,7 @@
 ## Tong quan
 
 OpenClaw chay trong Docker tren may picopiece-X99 (Ubuntu, 62GB RAM, 56 cores).
-Bot Telegram `@PicoPieceOpenClawBot` su dung LLM Google Gemini de tra loi tin nhan.
+Bot Telegram `@PicoPieceOpenClawBot` su dung DeepSeek (primary) va Google Gemini (fallback) de tra loi tin nhan.
 
 ## Cau truc thu muc
 
@@ -48,11 +48,21 @@ Bot Telegram `@PicoPieceOpenClawBot` su dung LLM Google Gemini de tra loi tin nh
 
 ### LLM
 
-- **Model chinh**: `google/gemini-2.5-flash-lite` (free tier: 15 RPM, 1000 request/ngay)
-- **Model thay the** (co san, doi khi can):
-  - `google/gemini-2.5-flash`: 10 RPM, 250 request/ngay, chat luong tot hon
-  - `google/gemini-2.5-pro`: 5 RPM, 100 request/ngay, chat luong cao nhat
+- **Model chinh**: `deepseek/deepseek-chat` (DeepSeek V3, 128K context, tra phi theo token)
+- **Fallback chain** (tu dong chuyen khi model chinh loi):
+  1. `google/gemini-2.5-flash` (free tier)
+  2. `google/gemini-2.5-flash-lite` (free tier)
+  3. `google/gemini-2.5-pro` (free tier)
+- **DeepSeek pricing**: ~$0.27/M input, $1.10/M output (cache hit: $0.07/M)
 - Doi model: `docker exec openclaw openclaw models set <model_id>`
+
+### DeepSeek Cost Tracking
+
+- **Script**: `/home/picopiece/openclaw/deepseek_cost_tracker.py`
+- **Cron**: Chay moi 4 gio, gui bao cao chi phi len Telegram
+- **Canh bao**: Tu dong gui khi balance giam duoi $1.50, $1.00, $0.50, $0.20
+- **State file**: `data/deepseek_cost_state.json`
+- **Chay thu cong**: `python3 /home/picopiece/openclaw/deepseek_cost_tracker.py`
 
 ### Telegram
 
@@ -162,3 +172,4 @@ docker compose pull && docker compose up -d
 - Dinh ky chay `openclaw security audit --deep` de kiem tra
 - Khi approve nguoi dung moi, xac nhan danh tinh truoc khi approve
 - Free tier Gemini: du lieu co the duoc Google su dung de train model
+- DeepSeek: tra phi theo token, theo doi balance qua cost tracker script
