@@ -1,11 +1,11 @@
 services:
   openclaw:
-    image: ghcr.io/openclaw/openclaw:latest
+    build: .
+    image: openclaw-custom:latest
     container_name: openclaw
     restart: unless-stopped
 
-    ports:
-      - "127.0.0.1:18789:18789"
+    network_mode: host
 
     user: "1000:1000"
     read_only: true
@@ -18,8 +18,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 4G
+          cpus: "8.0"
+          memory: 8G
+
+    shm_size: "256mb"
+
+    environment:
+      - PLAYWRIGHT_BROWSERS_PATH=/home/node/.openclaw/browsers
+      - CHROME_CRASHPAD_HANDLER_TRAMPOLINE_DISABLE=1
 
     env_file:
       - .env
@@ -28,7 +34,9 @@ services:
       - ./data:/home/node/.openclaw
 
     tmpfs:
-      - /tmp:noexec,nosuid,size=512M
+      - /tmp:size=512M
+      - /home/node/.cache:size=128M
+      - /var/cache/fontconfig:size=16M
 
     logging:
       driver: json-file

@@ -89,7 +89,6 @@ def run_once():
     api_key = cfg("DEEPSEEK_API_KEY")
     tg_token = cfg("TELEGRAM_BOT_TOKEN")
     tg_chat = cfg("TELEGRAM_CHAT_ID")
-    initial_bal = float(cfg("DEEPSEEK_INITIAL_BAL", "2.00"))
     thresholds = [float(x) for x in cfg("WARN_THRESHOLDS", "1.50,1.00,0.50,0.20").split(",")]
 
     if not api_key:
@@ -106,21 +105,37 @@ def run_once():
         sys.exit("No USD balance info returned")
 
     current_bal = float(usd_info["total_balance"])
-    spent = max(0, initial_bal - current_bal)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     state = load_state()
-    last_bal = state.get("last_balance", initial_bal)
-    session_delta = max(0, last_bal - current_bal)
+    last_bal = state.get("last_balance")
+    cumulative_spent = state.get("cumulative_spent", 0.0)
+    total_topup = state.get("total_topup", 0.0)
     warned = set(state.get("warned_thresholds", []))
+
+    if last_bal is None:
+        session_delta = 0.0
+    else:
+        balance_diff = last_bal - current_bal
+        if balance_diff >= 0:
+            session_delta = balance_diff
+        else:
+            topup_amount = current_bal - last_bal
+            total_topup += topup_amount
+            session_delta = 0.0
+
+    cumulative_spent += session_delta
 
     lines = [
         f"*DeepSeek Cost Report* — {now_str}",
         "",
-        f"Balance: *${current_bal:.2f}* / ${initial_bal:.2f}",
-        f"Total spent: *${spent:.2f}*",
+        f"Balance: *${current_bal:.2f}*",
+        f"Total spent: *${cumulative_spent:.2f}*",
         f"Since last check: ${session_delta:.4f}",
     ]
+
+    if total_topup > 0:
+        lines.append(f"Total topped up: ${total_topup:.2f}")
 
     if not data["is_available"]:
         lines.append("")
@@ -146,7 +161,9 @@ def run_once():
     state.update({
         "last_balance": current_bal,
         "last_check": now_str,
-        "total_spent": spent,
+        "cumulative_spent": round(cumulative_spent, 4),
+        "total_topup": round(total_topup, 2),
+        "total_spent": round(cumulative_spent, 4),
         "warned_thresholds": sorted(warned),
     })
     save_state(state)
