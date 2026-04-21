@@ -42,10 +42,19 @@ BINANCE_24H_API = "https://api.binance.com/api/v3/ticker/24hr"
 
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 TOP_N_COINS = 20
-MIN_VOLUME_USD = 20_000_000
+MIN_VOLUME_USD = 50_000_000  # raised from 20M for higher quality
 STABLECOIN_BLACKLIST = {"USDC", "USDT", "FDUSD", "TUSD", "DAI", "BUSD", "USD1", "RLUSD",
                          "USDP", "PYUSD", "AEUR", "EURI", "EUROC", "EUR", "GBP", "BRL",
                          "PAXG", "WBTC", "WBETH", "STETH", "CBBTC", "WETH", "U"}
+# Filter out high-volatility meme/lowcap coins prone to wicks and pump/dump.
+# These can still be CORE_SYMBOLS overridden — blacklist applies only to auto-discovery.
+MEME_BLACKLIST = {
+    "PEPE", "1000PEPE", "SHIB", "1000SHIB", "FLOKI", "1000FLOKI",
+    "BONK", "1000BONK", "WIF", "DOGE", "MEME", "POPCAT", "BOME",
+    "NEIRO", "1000NEIRO", "TURBO", "BRETT", "MEW", "BOOK", "TRUMP",
+    "PNUT", "GOAT", "ACT", "MOODENG", "BAN", "FARTCOIN", "CHILLGUY",
+    "1000SATS", "1000RATS", "PONKE", "MOG", "DEGEN",
+}
 SYMBOL_CACHE_FILE = SCRIPT_DIR / "data" / "top_coins_cache.json"
 SYMBOL_CACHE_TTL = 3600
 
@@ -71,7 +80,7 @@ RSI_SHORT_MAX = 55
 RSI_MOMENTUM_DELTA = 3
 
 ATR_SL_MULT = 2.0
-ATR_TP_MULT = 3.0
+ATR_TP_MULT = 3.5  # R:R 1.75 — buffer for 0.08% round-trip fee
 
 # --- Portfolio Risk Management ---
 PORTFOLIO_BALANCE = float(os.environ.get("PORTFOLIO_BALANCE", "1000"))
@@ -110,7 +119,12 @@ def discover_top_coins() -> tuple[list[str], dict[str, str]]:
             base = sym.replace("USDT", "")
             if base in STABLECOIN_BLACKLIST:
                 continue
+            if base in MEME_BLACKLIST and sym not in CORE_SYMBOLS:
+                continue
             if len(base) > 10:
+                continue
+            # Skip leveraged tokens (UP/DOWN/BULL/BEAR suffixes)
+            if any(base.endswith(suf) for suf in ("UP", "DOWN", "BULL", "BEAR")) and base not in {"FUEL", "JUP"}:
                 continue
             vol = float(d["quoteVolume"])
             if vol < MIN_VOLUME_USD:
@@ -269,10 +283,12 @@ def fetch_klines(symbol: str) -> dict:
     h24 = max(highs[-24:]) if len(highs) >= 24 else max(highs)
     l24 = min(lows[-24:]) if len(lows) >= 24 else min(lows)
 
-    # 4h ATR for SL/TP (wider, more reliable)
+    # 4h ATR for SL/TP + 4h EMA cross for trend confirmation
     atr_4h = atr_1h
+    ema_fast_4h = None
+    ema_slow_4h = None
     try:
-        url4h = f"{BINANCE_KLINES_API}?symbol={symbol}&interval={ATR_KLINES_INTERVAL}&limit={ATR_KLINES_LIMIT}"
+        url4h = f"{BINANCE_KLINES_API}?symbol={symbol}&interval={ATR_KLINES_INTERVAL}&limit=60"
         req4h = urllib.request.Request(url4h, headers={"User-Agent": "PicoAlerts/1.0"})
         with urllib.request.urlopen(req4h, timeout=10) as resp4h:
             raw4h = json.loads(resp4h.read())
@@ -280,8 +296,15 @@ def fetch_klines(symbol: str) -> dict:
         l4h = [float(k[3]) for k in raw4h]
         c4h = [float(k[4]) for k in raw4h]
         atr_4h = calc_atr(h4h, l4h, c4h, ATR_PERIOD) or atr_1h
+        ema_fast_4h = calc_ema(c4h, EMA_FAST_PERIOD)
+        ema_slow_4h = calc_ema(c4h, EMA_SLOW_PERIOD)
     except Exception:
         pass
+
+    if ema_fast_4h is not None and ema_slow_4h is not None:
+        ema_cross_4h = "BULLISH" if ema_fast_4h > ema_slow_4h else "BEARISH"
+    else:
+        ema_cross_4h = "UNKNOWN"
 
     try:
         levels = calc_dynamic_levels(symbol)
@@ -297,6 +320,9 @@ def fetch_klines(symbol: str) -> dict:
         "ema20": ema_fast,
         "ema50": ema_slow,
         "ema_cross": "BULLISH" if (ema_fast and ema_slow and ema_fast > ema_slow) else "BEARISH",
+        "ema_cross_4h": ema_cross_4h,
+        "ema20_4h": ema_fast_4h,
+        "ema50_4h": ema_slow_4h,
         "ema_gap_pct": round(ema_gap_pct, 3),
         "atr": atr_4h,
         "atr_1h": atr_1h,
@@ -346,6 +372,9 @@ def format_indicator_line(ind: dict, price: float) -> str:
     ema_gap = ind.get("ema_gap_pct", 0)
     if ema_cross:
         parts.append(f"EMAx:{ema_cross}({ema_gap:+.2f}%)")
+    ema_4h = ind.get("ema_cross_4h")
+    if ema_4h and ema_4h != "UNKNOWN":
+        parts.append(f"4h:{'BULL' if ema_4h == 'BULLISH' else 'BEAR'}")
     if ind.get("atr") is not None:
         parts.append(f"ATR:{fmt_price(ind['atr'])}")
     if ind.get("vol_ratio") is not None:
@@ -484,6 +513,7 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         vol_ratio = ind.get("vol_ratio")
         trend = ind.get("trend", "UNKNOWN")
         ema_cross = ind.get("ema_cross", "")
+        ema_cross_4h = ind.get("ema_cross_4h", "UNKNOWN")
 
         if rsi is None or ema_fast is None or ema_slow is None or atr is None or vol_ratio is None:
             continue
@@ -506,8 +536,10 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         # 4. Volume confirmation
         # 5. Trend = UPTREND (price > EMA20 > EMA50)
         trend_bullish = trend == "UPTREND"
+        # 6. Multi-timeframe: 4h EMA cross must also be BULLISH (or UNKNOWN if missing data)
+        mtf_bullish = ema_cross_4h in ("BULLISH", "UNKNOWN")
 
-        if ema_bullish and price_above_ema and rsi_long_ok and vol_ok and trend_bullish:
+        if ema_bullish and price_above_ema and rsi_long_ok and vol_ok and trend_bullish and mtf_bullish:
             entry = round(price, 6)
             sl = round(entry - ATR_SL_MULT * atr, 6)
             tp = round(entry + ATR_TP_MULT * atr, 6)
@@ -532,6 +564,7 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 "ema20": round(ema_fast, 6),
                 "ema50": round(ema_slow, 6),
                 "ema_gap_pct": round(ema_gap_pct, 3),
+                "ema_cross_4h": ema_cross_4h,
                 "vol_ratio": round(vol_ratio, 2),
                 "trend": trend,
                 "rr_ratio": round(ATR_TP_MULT / ATR_SL_MULT, 2),
@@ -555,8 +588,10 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         # 4. Volume confirmation
         # 5. Trend = DOWNTREND (price < EMA20 < EMA50)
         trend_bearish = trend == "DOWNTREND"
+        # 6. Multi-timeframe: 4h EMA cross must also be BEARISH (or UNKNOWN if missing)
+        mtf_bearish = ema_cross_4h in ("BEARISH", "UNKNOWN")
 
-        if ema_bearish and price_below_ema and rsi_short_ok and vol_ok and trend_bearish:
+        if ema_bearish and price_below_ema and rsi_short_ok and vol_ok and trend_bearish and mtf_bearish:
             entry = round(price, 6)
             sl = round(entry + ATR_SL_MULT * atr, 6)
             tp = round(entry - ATR_TP_MULT * atr, 6)
@@ -581,6 +616,7 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 "ema20": round(ema_fast, 6),
                 "ema50": round(ema_slow, 6),
                 "ema_gap_pct": round(ema_gap_pct, 3),
+                "ema_cross_4h": ema_cross_4h,
                 "vol_ratio": round(vol_ratio, 2),
                 "trend": trend,
                 "rr_ratio": round(ATR_TP_MULT / ATR_SL_MULT, 2),
@@ -642,27 +678,34 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
     atr = signal.get("atr", 0)
 
     ema_cross_str = "BULLISH (EMA20>EMA50)" if ema20 > ema50 else "BEARISH (EMA20<EMA50)"
+    ema_cross_4h_str = signal.get("ema_cross_4h", "UNKNOWN")
+    mtf_align = "ALIGNED" if (
+        (direction == "LONG" and ema_cross_4h_str == "BULLISH") or
+        (direction == "SHORT" and ema_cross_4h_str == "BEARISH")
+    ) else ("UNKNOWN" if ema_cross_4h_str == "UNKNOWN" else "DIVERGED")
 
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal and decide CONFIRM or REJECT.
 
 SIGNAL: {coin} {direction}
 Entry: ${entry} | SL: ${sl} | TP: ${tp} | R:R: {rr}
 RSI(14): {rsi:.1f} (prev: {rsi_prev:.1f}, delta: {rsi-rsi_prev:+.1f})
-EMA20: ${ema20} | EMA50: ${ema50} | EMA cross: {ema_cross_str} (gap: {ema_gap:+.2f}%)
+EMA20: ${ema20} | EMA50: ${ema50} | EMA cross 1h: {ema_cross_str} (gap: {ema_gap:+.2f}%)
+EMA cross 4h: {ema_cross_4h_str} (multi-timeframe: {mtf_align})
 Volume ratio: {vol_ratio:.2f}x | ATR(4h): ${atr}
 Trend: {trend} | Strength: {strength}
 Currently {active_count} other positions open.
 
 REJECT if ANY of these:
-1. {direction} against EMA cross (e.g. LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
+1. {direction} against EMA cross 1h (e.g. LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
 2. EMA gap too small (<0.1%) — cross not confirmed, high whipsaw risk
-3. Volume ratio < 1.0 (no volume confirmation)
-4. R:R < 1.3 after fees
-5. Already {active_count} positions open AND this is a MODERATE signal
-6. RSI in extreme zone for the direction (LONG with RSI>70, SHORT with RSI<30)
-7. {direction} against strong trend (LONG when RSI>75 and dropping, SHORT when RSI<25 and rising)
+3. Multi-timeframe DIVERGED — 4h trend opposes 1h signal (very risky)
+4. Volume ratio < 1.0 (no volume confirmation)
+5. R:R < 1.5 after fees (need buffer for 0.08% round-trip taker fee)
+6. Already {active_count} positions open AND this is a MODERATE signal
+7. RSI in extreme zone for the direction (LONG with RSI>70, SHORT with RSI<30)
+8. {direction} against strong reversal (LONG when RSI>75 and dropping, SHORT when RSI<25 and rising)
 
-CONFIRM if EMA cross aligns with direction, RSI has momentum, volume confirms, and good R:R.
+CONFIRM if EMA cross 1h+4h ALIGNED with direction, RSI has momentum, volume confirms, R:R >= 1.5.
 
 Reply ONLY in this JSON format, nothing else:
 {{"decision": "CONFIRM" or "REJECT", "reason": "one sentence", "confidence": 0-100}}"""
@@ -1013,6 +1056,7 @@ def run_once():
         if signals:
             best = signals[0]
             mark_alerted(alert_state, f"signal_{best['coin']}")
+            alert_state["last_signal_ts"] = time.time()
 
             coin_u = best["coin"].upper()
             strength = best.get("strength", "MODERATE")
@@ -1081,7 +1125,7 @@ def run_once():
                         f"Size: ${pos_usd:,.0f} ({qty:.4f} {coin_u})\n"
                         f"Risk: ${risk_usd:.0f} ({RISK_PER_TRADE_PCT:.0f}% of portfolio)\n"
                         f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | EMA50:{fmt_price(best['ema50'])}\n"
-                        f"EMA cross: {best.get('ema_gap_pct', 0):+.2f}% gap\n"
+                        f"EMA 1h: {best.get('ema_gap_pct', 0):+.2f}% gap | EMA 4h: {best.get('ema_cross_4h', 'N/A')}\n"
                         f"Vol:{best['vol_ratio']:.1f}x | ATR4h:{fmt_price(best['atr'])} | {best['trend']}\n\n"
                         f"🤖 *LLM ({confidence}%):* {reason}\n"
                         f"_Auto-executing via trade executor..._"
@@ -1099,7 +1143,7 @@ def run_once():
                     f"Size: ${pos_usd:,.0f} ({qty:.4f} {coin_u})\n"
                     f"Risk: ${risk_usd:.0f} ({RISK_PER_TRADE_PCT:.0f}% of portfolio)\n"
                     f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | EMA50:{fmt_price(best['ema50'])}\n"
-                    f"EMA cross: {best.get('ema_gap_pct', 0):+.2f}% gap\n"
+                    f"EMA 1h: {best.get('ema_gap_pct', 0):+.2f}% gap | EMA 4h: {best.get('ema_cross_4h', 'N/A')}\n"
                     f"Vol:{best['vol_ratio']:.1f}x | ATR4h:{fmt_price(best['atr'])} | {best['trend']}\n\n"
                     f"_Awaiting LLM news review (next cron cycle)_"
                 )
@@ -1108,6 +1152,30 @@ def run_once():
             send_telegram(tg_token, tg_chat, msg)
         else:
             print("  No signals.")
+            # Idle market alert: no signal for IDLE_ALERT_HOURS, alert once per IDLE_ALERT_COOLDOWN_HOURS
+            IDLE_ALERT_HOURS = 48
+            IDLE_ALERT_COOLDOWN_HOURS = 24
+            last_signal_ts = alert_state.get("last_signal_ts")
+            if last_signal_ts is None:
+                # Initialize on first idle so we don't alert immediately
+                alert_state["last_signal_ts"] = time.time()
+            else:
+                last_idle_ts = alert_state.get("last_idle_alert_ts", 0)
+                idle_for = (time.time() - last_signal_ts) / 3600
+                since_last_idle = (time.time() - last_idle_ts) / 3600
+                if idle_for >= IDLE_ALERT_HOURS and since_last_idle >= IDLE_ALERT_COOLDOWN_HOURS:
+                    active_count = sum(1 for s in trading_state.get("states", {}).values() if s.get("state") == "ACTIVE")
+                    last_str = datetime.fromtimestamp(last_signal_ts, timezone.utc).strftime("%m/%d %H:%M UTC")
+                    send_telegram(
+                        tg_token, tg_chat,
+                        f"💤 *Market Idle Alert*\n"
+                        f"No new signals for *{idle_for:.0f}h* (last: {last_str}).\n"
+                        f"Active positions: {active_count}\n"
+                        f"Possible causes: low volatility, sideways market, strict EMA filter.\n"
+                        f"Consider: review filter strictness or wait for trend.",
+                    )
+                    alert_state["last_idle_alert_ts"] = time.time()
+                    print(f"  IDLE ALERT sent (idle for {idle_for:.0f}h)")
 
     alert_state["last_prices"] = {s: p for s, p in prices.items()}
     alert_state["last_check"] = now_str

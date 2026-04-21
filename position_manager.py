@@ -383,6 +383,7 @@ def llm_review_position(coin: str, direction: str, entry: float, current: float,
     pnl_pct = ((current - entry) / entry * 100) if direction == "LONG" else ((entry - current) / entry * 100)
     fee_cost_pct = TAKER_FEE_PCT * 2  # round-trip fee
     position_value = fill_qty * current
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
 
     prompt = f"""You are a crypto futures position manager. Review this open position and decide the best action.
 
@@ -390,7 +391,7 @@ POSITION: {coin.upper()} {direction}
 Entry: ${entry} | Current: ${current} | P&L: {pnl_pct:+.2f}%
 SL: ${sl} | TP: ${tp}
 ATR(4h): ${atr:.6f} | Profit: {profit_atr:.2f}x ATR
-RSI(14): {rsi:.1f if rsi else 'N/A'}
+RSI(14): {rsi_str}
 Current trail tier: {current_tier}
 Suggested new SL: ${suggested_new_sl:.6f}
 Position size: {fill_qty} units (${position_value:.2f})
@@ -500,25 +501,64 @@ def calculate_trail_tier(direction: str, entry: float, current: float,
 
 def execute_trail_sl(coin: str, cs: dict, symbol: str, new_sl: float,
                      direction: str) -> bool:
-    """Cancel old SL, place new SL at new_sl. Returns True on success."""
+    """Safely move SL: cancel old → place new. If new fails, try restoring old.
+    If restore also fails → emergency Telegram alert (position is unprotected).
+    Returns True on success."""
     old_sl_id = cs.get("sl_order_id", "")
+    old_sl_price = cs.get("sl_price", 0)
     close_side = "SELL" if direction == "LONG" else "BUY"
     new_sl_str = round_price(symbol, new_sl)
 
-    # Cancel old SL
+    # Step 1: cancel old SL (must do this — Binance rejects duplicate closePosition)
     if old_sl_id:
         try:
             r = cancel_algo_order(int(old_sl_id))
-            log(f"  Cancelled old SL #{old_sl_id}: {r.get('algoStatus', r.get('code', 'ok'))}")
+            status = r.get("algoStatus", r.get("code", "?"))
+            log(f"  Cancelled old SL #{old_sl_id}: {status}")
+            if "error" in r and "code" not in r.get("error", "") and "Algo order not exists" not in r.get("error", ""):
+                # Cancel may have failed — try to place new SL anyway
+                # If old SL still active, new placement will fail with -4130
+                log(f"  WARN: cancel may have failed, attempting place anyway")
         except Exception as e:
-            log(f"  Warning: failed to cancel old SL: {e}")
+            log(f"  WARN: failed to cancel old SL: {e}")
 
-    time.sleep(0.3)
+    time.sleep(0.5)
 
-    # Place new SL
+    # Step 2: place new SL
     r = place_sl_order(symbol, close_side, new_sl_str)
     if "error" in r:
-        log(f"  ERROR placing new SL: {r['error']}")
+        err_msg = r["error"]
+        log(f"  ERROR placing new SL: {err_msg}")
+
+        # Step 3: emergency — try to restore old SL
+        if old_sl_price and old_sl_price != new_sl:
+            log(f"  EMERGENCY: attempting to restore old SL @ {old_sl_price}")
+            old_sl_str = round_price(symbol, old_sl_price)
+            time.sleep(0.5)
+            restore_r = place_sl_order(symbol, close_side, old_sl_str)
+            if "error" in restore_r:
+                log(f"  CRITICAL: restore failed: {restore_r['error']}")
+                msg = (
+                    f"🚨 *CRITICAL — {coin.upper()} {direction} SL UNPROTECTED*\n"
+                    f"Failed to trail SL AND failed to restore old SL.\n"
+                    f"New SL ${new_sl_str} error: {err_msg[:100]}\n"
+                    f"Restore error: {restore_r['error'][:100]}\n"
+                    f"⚠️ MANUAL INTERVENTION NEEDED — check Binance app"
+                )
+                send_telegram(msg)
+                cs["sl_order_id"] = ""  # mark as orphaned
+                return False
+            else:
+                restored_id = str(restore_r.get("algoId", ""))
+                cs["sl_order_id"] = restored_id
+                cs["sl_price"] = float(old_sl_str)
+                log(f"  Restored old SL @ {old_sl_str} (algo #{restored_id})")
+                msg = (
+                    f"⚠️ *{coin.upper()} {direction} — SL trail failed, restored old*\n"
+                    f"Old SL kept @ ${old_sl_str}\n"
+                    f"Tried new SL ${new_sl_str}: {err_msg[:100]}"
+                )
+                send_telegram(msg)
         return False
 
     new_sl_id = str(r.get("algoId", ""))
@@ -530,7 +570,8 @@ def execute_trail_sl(coin: str, cs: dict, symbol: str, new_sl: float,
 
 def execute_partial_close(coin: str, cs: dict, symbol: str, close_pct: int,
                           direction: str, current_price: float) -> float:
-    """Close a portion of the position. Returns realized PnL of the closed portion."""
+    """Close a portion of the position. Returns realized PnL of the closed portion.
+    Safety: if market close fails after canceling SL/TP, restore them immediately."""
     fill_qty = cs.get("fill_qty", 0)
     if fill_qty <= 0:
         return 0.0
@@ -545,9 +586,10 @@ def execute_partial_close(coin: str, cs: dict, symbol: str, close_pct: int,
 
     close_side = "SELL" if direction == "LONG" else "BUY"
 
-    # Cancel existing SL/TP (they use closePosition=true for full position)
     old_sl_id = cs.get("sl_order_id", "")
     old_tp_id = cs.get("tp_order_id", "")
+    old_sl_price = cs.get("sl_price", 0)
+    old_tp_price = cs.get("tp_price", 0)
     if old_sl_id:
         try:
             cancel_algo_order(int(old_sl_id))
@@ -564,6 +606,23 @@ def execute_partial_close(coin: str, cs: dict, symbol: str, close_pct: int,
     r = market_close_partial(symbol, close_side, close_qty_str)
     if "error" in r:
         log(f"  ERROR partial close: {r['error']}")
+        # Emergency: restore SL and TP since position still open
+        log(f"  EMERGENCY: restoring SL/TP after failed partial close")
+        if old_sl_price:
+            sl_r = place_sl_order(symbol, close_side, round_price(symbol, old_sl_price))
+            if "error" not in sl_r:
+                cs["sl_order_id"] = str(sl_r.get("algoId", ""))
+                log(f"  Restored SL @ {old_sl_price}")
+        if old_tp_price:
+            tp_r = place_tp_order(symbol, close_side, round_price(symbol, old_tp_price))
+            if "error" not in tp_r:
+                cs["tp_order_id"] = str(tp_r.get("algoId", ""))
+                log(f"  Restored TP @ {old_tp_price}")
+        send_telegram(
+            f"⚠️ *{coin.upper()} {direction} — partial close failed*\n"
+            f"Original SL/TP restored. Position size unchanged.\n"
+            f"Error: {r['error'][:100]}"
+        )
         return 0.0
 
     entry = cs.get("entry_price", 0)
