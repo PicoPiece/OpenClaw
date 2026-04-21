@@ -90,6 +90,7 @@ def run_once():
     tg_token = cfg("TELEGRAM_BOT_TOKEN")
     tg_chat = cfg("TELEGRAM_CHAT_ID")
     thresholds = [float(x) for x in cfg("WARN_THRESHOLDS", "1.50,1.00,0.50,0.20").split(",")]
+    daily_limit = float(cfg("DEEPSEEK_DAILY_LIMIT", "2.00"))
 
     if not api_key:
         sys.exit("DEEPSEEK_API_KEY not set")
@@ -105,13 +106,24 @@ def run_once():
         sys.exit("No USD balance info returned")
 
     current_bal = float(usd_info["total_balance"])
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%d %H:%M UTC")
+    today_str = now.strftime("%Y-%m-%d")
 
     state = load_state()
     last_bal = state.get("last_balance")
     cumulative_spent = state.get("cumulative_spent", 0.0)
     total_topup = state.get("total_topup", 0.0)
     warned = set(state.get("warned_thresholds", []))
+
+    daily_date = state.get("daily_date", today_str)
+    daily_spent = state.get("daily_spent", 0.0)
+    daily_warned = set(state.get("daily_warned", []))
+
+    if daily_date != today_str:
+        daily_spent = 0.0
+        daily_warned = set()
+        daily_date = today_str
 
     if last_bal is None:
         session_delta = 0.0
@@ -125,11 +137,13 @@ def run_once():
             session_delta = 0.0
 
     cumulative_spent += session_delta
+    daily_spent += session_delta
 
     lines = [
         f"*DeepSeek Cost Report* — {now_str}",
         "",
         f"Balance: *${current_bal:.2f}*",
+        f"Today spent: *${daily_spent:.4f}* / ${daily_limit:.2f} limit",
         f"Total spent: *${cumulative_spent:.2f}*",
         f"Since last check: ${session_delta:.4f}",
     ]
@@ -140,6 +154,22 @@ def run_once():
     if not data["is_available"]:
         lines.append("")
         lines.append("*BALANCE DEPLETED — API calls will fail!*")
+
+    daily_thresholds = [0.50, 1.00, 1.50, daily_limit]
+    daily_alerts = []
+    for dt in daily_thresholds:
+        dt_key = f"daily_{dt:.2f}"
+        if daily_spent >= dt and dt_key not in daily_warned:
+            daily_alerts.append(dt)
+            daily_warned.add(dt_key)
+
+    if daily_alerts:
+        lines.append("")
+        for dt in daily_alerts:
+            if dt >= daily_limit:
+                lines.append(f"*DAILY LIMIT HIT* — spent ${daily_spent:.2f} today (limit: ${daily_limit:.2f})")
+            else:
+                lines.append(f"Daily warning: spent ${daily_spent:.4f} today (threshold: ${dt:.2f})")
 
     new_warnings = []
     for t in sorted(thresholds, reverse=True):
@@ -165,6 +195,9 @@ def run_once():
         "total_topup": round(total_topup, 2),
         "total_spent": round(cumulative_spent, 4),
         "warned_thresholds": sorted(warned),
+        "daily_date": daily_date,
+        "daily_spent": round(daily_spent, 4),
+        "daily_warned": sorted(daily_warned),
     })
     save_state(state)
 
