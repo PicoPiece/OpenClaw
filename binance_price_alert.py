@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Binance Price Alert v3 — Hybrid Trading Signal System
+Binance Price Alert v4 — Hybrid Trading Signal System
 
-Layer 1: Python rule-based signal generator with TA (RSI, EMA, SMA, ATR, Volume)
-Layer 2: LLM reviews pending signals via OpenClaw cron (news + macro check)
+Layer 1: Python rule-based signal generator with TA (RSI, EMA20/EMA50 cross, ATR, Volume)
+Layer 2: LLM reviews pending signals (real-time DeepSeek review before execution)
 
 Zero dependencies beyond Python stdlib.
 
@@ -55,10 +55,10 @@ SYMBOL_MAP: dict[str, str] = {}
 REVERSAL_PCT = 0.03
 
 RSI_PERIOD = 14
-EMA_PERIOD = 20
-SMA_PERIOD = 50
+EMA_FAST_PERIOD = 20
+EMA_SLOW_PERIOD = 50
 ATR_PERIOD = 14
-KLINES_LIMIT = 55
+KLINES_LIMIT = 60
 KLINES_INTERVAL = "1h"
 ATR_KLINES_INTERVAL = "4h"
 ATR_KLINES_LIMIT = 20
@@ -175,7 +175,7 @@ def calc_rsi(closes: list, period: int = RSI_PERIOD) -> float | None:
     return 100 - (100 / (1 + rs))
 
 
-def calc_ema(closes: list, period: int = EMA_PERIOD) -> float | None:
+def calc_ema(closes: list, period: int = EMA_FAST_PERIOD) -> float | None:
     if len(closes) < period:
         return None
     multiplier = 2 / (period + 1)
@@ -183,12 +183,6 @@ def calc_ema(closes: list, period: int = EMA_PERIOD) -> float | None:
     for price in closes[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
-
-
-def calc_sma(closes: list, period: int = SMA_PERIOD) -> float | None:
-    if len(closes) < period:
-        return None
-    return sum(closes[-period:]) / period
 
 
 def calc_atr(highs: list, lows: list, closes: list, period: int = ATR_PERIOD) -> float | None:
@@ -214,16 +208,20 @@ def calc_volume_ratio(volumes: list, period: int = 20) -> float | None:
     return volumes[-1] / avg_vol
 
 
-def detect_trend(price: float, ema: float | None, sma: float | None) -> str:
-    if ema is None or sma is None:
+def detect_trend(price: float, ema_fast: float | None, ema_slow: float | None) -> str:
+    """Strict trend detection using EMA20/EMA50 crossover.
+    Only UPTREND and DOWNTREND are valid for signal generation."""
+    if ema_fast is None or ema_slow is None:
         return "UNKNOWN"
-    if price > ema > sma:
+    if ema_fast > ema_slow and price > ema_fast:
         return "UPTREND"
-    if price < ema < sma:
+    if ema_fast < ema_slow and price < ema_fast:
         return "DOWNTREND"
-    if price > sma:
-        return "SIDEWAYS-BULL"
-    return "SIDEWAYS-BEAR"
+    if ema_fast > ema_slow:
+        return "NEUTRAL-BULL"
+    if ema_fast < ema_slow:
+        return "NEUTRAL-BEAR"
+    return "NEUTRAL"
 
 
 def calc_dynamic_levels(symbol: str) -> dict:
@@ -261,12 +259,12 @@ def fetch_klines(symbol: str) -> dict:
 
     rsi_now = calc_rsi(closes, RSI_PERIOD)
     rsi_prev = calc_rsi(closes[:-1], RSI_PERIOD) if len(closes) > RSI_PERIOD + 1 else None
-    ema = calc_ema(closes, EMA_PERIOD)
-    sma = calc_sma(closes, SMA_PERIOD)
+    ema_fast = calc_ema(closes, EMA_FAST_PERIOD)
+    ema_slow = calc_ema(closes, EMA_SLOW_PERIOD)
     atr_1h = calc_atr(highs, lows, closes, ATR_PERIOD)
     vol_ratio = calc_volume_ratio(volumes)
     price = closes[-1]
-    trend = detect_trend(price, ema, sma)
+    trend = detect_trend(price, ema_fast, ema_slow)
 
     h24 = max(highs[-24:]) if len(highs) >= 24 else max(highs)
     l24 = min(lows[-24:]) if len(lows) >= 24 else min(lows)
@@ -290,12 +288,16 @@ def fetch_klines(symbol: str) -> dict:
     except Exception:
         levels = {"breakout": h24 * 1.02, "breakdown": l24 * 0.98, "high_7d": h24, "low_7d": l24}
 
+    ema_gap_pct = ((ema_fast - ema_slow) / ema_slow * 100) if ema_fast and ema_slow and ema_slow != 0 else 0
+
     return {
         "price": price,
         "rsi": rsi_now,
         "rsi_prev": rsi_prev,
-        "ema20": ema,
-        "sma50": sma,
+        "ema20": ema_fast,
+        "ema50": ema_slow,
+        "ema_cross": "BULLISH" if (ema_fast and ema_slow and ema_fast > ema_slow) else "BEARISH",
+        "ema_gap_pct": round(ema_gap_pct, 3),
         "atr": atr_4h,
         "atr_1h": atr_1h,
         "vol_ratio": vol_ratio,
@@ -338,8 +340,12 @@ def format_indicator_line(ind: dict, price: float) -> str:
         parts.append(f"RSI:{rsi:.0f}{tag}")
     if ind.get("ema20") is not None:
         parts.append(f"EMA20:{fmt_price(ind['ema20'])}")
-    if ind.get("sma50") is not None:
-        parts.append(f"SMA50:{fmt_price(ind['sma50'])}")
+    if ind.get("ema50") is not None:
+        parts.append(f"EMA50:{fmt_price(ind['ema50'])}")
+    ema_cross = ind.get("ema_cross", "")
+    ema_gap = ind.get("ema_gap_pct", 0)
+    if ema_cross:
+        parts.append(f"EMAx:{ema_cross}({ema_gap:+.2f}%)")
     if ind.get("atr") is not None:
         parts.append(f"ATR:{fmt_price(ind['atr'])}")
     if ind.get("vol_ratio") is not None:
@@ -472,29 +478,36 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         ind = indicators[symbol]
         rsi = ind.get("rsi")
         rsi_prev = ind.get("rsi_prev")
-        ema = ind.get("ema20")
-        sma = ind.get("sma50")
+        ema_fast = ind.get("ema20")
+        ema_slow = ind.get("ema50")
         atr = ind.get("atr")
         vol_ratio = ind.get("vol_ratio")
         trend = ind.get("trend", "UNKNOWN")
+        ema_cross = ind.get("ema_cross", "")
 
-        if rsi is None or ema is None or sma is None or atr is None or vol_ratio is None:
+        if rsi is None or ema_fast is None or ema_slow is None or atr is None or vol_ratio is None:
             continue
         if rsi_prev is None:
             continue
 
         rsi_delta = rsi - rsi_prev
         vol_ok = vol_ratio >= VOLUME_CONFIRM_RATIO
+        ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100 if ema_slow else 0
 
         # --- LONG rules (ALL must pass) ---
+        # 1. EMA20 > EMA50 (bullish cross confirmed)
+        ema_bullish = ema_fast > ema_slow
+        # 2. Price above EMA20 (momentum)
+        price_above_ema = price > ema_fast
+        # 3. RSI momentum: cross up from oversold OR strong bullish delta
         rsi_cross_up = rsi_prev < RSI_OVERSOLD and rsi >= RSI_OVERSOLD
         rsi_strong_bull = rsi > RSI_LONG_MIN and rsi_delta >= RSI_MOMENTUM_DELTA
         rsi_long_ok = rsi_cross_up or rsi_strong_bull
-        price_above_ema = price > ema
-        price_above_sma = price > sma
-        trend_bullish = trend in ("UPTREND", "SIDEWAYS-BULL")
+        # 4. Volume confirmation
+        # 5. Trend = UPTREND (price > EMA20 > EMA50)
+        trend_bullish = trend == "UPTREND"
 
-        if rsi_long_ok and price_above_ema and price_above_sma and vol_ok and trend_bullish:
+        if ema_bullish and price_above_ema and rsi_long_ok and vol_ok and trend_bullish:
             entry = round(price, 6)
             sl = round(entry - ATR_SL_MULT * atr, 6)
             tp = round(entry + ATR_TP_MULT * atr, 6)
@@ -516,8 +529,9 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 "rsi": round(rsi, 1),
                 "rsi_prev": round(rsi_prev, 1),
                 "rsi_delta": round(rsi_delta, 1),
-                "ema20": round(ema, 6),
-                "sma50": round(sma, 6),
+                "ema20": round(ema_fast, 6),
+                "ema50": round(ema_slow, 6),
+                "ema_gap_pct": round(ema_gap_pct, 3),
                 "vol_ratio": round(vol_ratio, 2),
                 "trend": trend,
                 "rr_ratio": round(ATR_TP_MULT / ATR_SL_MULT, 2),
@@ -530,14 +544,19 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
             })
 
         # --- SHORT rules (ALL must pass) ---
+        # 1. EMA20 < EMA50 (bearish cross confirmed)
+        ema_bearish = ema_fast < ema_slow
+        # 2. Price below EMA20
+        price_below_ema = price < ema_fast
+        # 3. RSI momentum: cross down from overbought OR strong bearish delta
         rsi_cross_down = rsi_prev > RSI_OVERBOUGHT and rsi <= RSI_OVERBOUGHT
         rsi_strong_bear = rsi < RSI_SHORT_MAX and rsi_delta <= -RSI_MOMENTUM_DELTA
         rsi_short_ok = rsi_cross_down or rsi_strong_bear
-        price_below_ema = price < ema
-        price_below_sma = price < sma
-        trend_bearish = trend in ("DOWNTREND", "SIDEWAYS-BEAR")
+        # 4. Volume confirmation
+        # 5. Trend = DOWNTREND (price < EMA20 < EMA50)
+        trend_bearish = trend == "DOWNTREND"
 
-        if rsi_short_ok and price_below_ema and price_below_sma and vol_ok and trend_bearish:
+        if ema_bearish and price_below_ema and rsi_short_ok and vol_ok and trend_bearish:
             entry = round(price, 6)
             sl = round(entry + ATR_SL_MULT * atr, 6)
             tp = round(entry - ATR_TP_MULT * atr, 6)
@@ -559,8 +578,9 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 "rsi": round(rsi, 1),
                 "rsi_prev": round(rsi_prev, 1),
                 "rsi_delta": round(rsi_delta, 1),
-                "ema20": round(ema, 6),
-                "sma50": round(sma, 6),
+                "ema20": round(ema_fast, 6),
+                "ema50": round(ema_slow, 6),
+                "ema_gap_pct": round(ema_gap_pct, 3),
                 "vol_ratio": round(vol_ratio, 2),
                 "trend": trend,
                 "rr_ratio": round(ATR_TP_MULT / ATR_SL_MULT, 2),
@@ -613,32 +633,36 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
     rsi = signal.get("rsi", 0)
     rsi_prev = signal.get("rsi_prev", 0)
     ema20 = signal.get("ema20", 0)
-    sma50 = signal.get("sma50", 0)
+    ema50 = signal.get("ema50", 0)
+    ema_gap = signal.get("ema_gap_pct", 0)
     vol_ratio = signal.get("vol_ratio", 0)
     trend = signal.get("trend", "")
     strength = signal.get("strength", "")
     rr = signal.get("rr_ratio", 0)
     atr = signal.get("atr", 0)
 
+    ema_cross_str = "BULLISH (EMA20>EMA50)" if ema20 > ema50 else "BEARISH (EMA20<EMA50)"
+
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal and decide CONFIRM or REJECT.
 
 SIGNAL: {coin} {direction}
 Entry: ${entry} | SL: ${sl} | TP: ${tp} | R:R: {rr}
 RSI(14): {rsi:.1f} (prev: {rsi_prev:.1f}, delta: {rsi-rsi_prev:+.1f})
-EMA20: ${ema20} | SMA50: ${sma50}
+EMA20: ${ema20} | EMA50: ${ema50} | EMA cross: {ema_cross_str} (gap: {ema_gap:+.2f}%)
 Volume ratio: {vol_ratio:.2f}x | ATR(4h): ${atr}
 Trend: {trend} | Strength: {strength}
 Currently {active_count} other positions open.
 
 REJECT if ANY of these:
-1. {direction} against strong trend (e.g. LONG when RSI>75 and dropping, SHORT when RSI<25 and rising)
-2. Volume ratio < 1.0 (no volume confirmation)
-3. R:R < 1.3 after fees
-4. Already {active_count} positions open AND this is a MODERATE signal
-5. Signal contradicts the trend direction
+1. {direction} against EMA cross (e.g. LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
+2. EMA gap too small (<0.1%) — cross not confirmed, high whipsaw risk
+3. Volume ratio < 1.0 (no volume confirmation)
+4. R:R < 1.3 after fees
+5. Already {active_count} positions open AND this is a MODERATE signal
 6. RSI in extreme zone for the direction (LONG with RSI>70, SHORT with RSI<30)
+7. {direction} against strong trend (LONG when RSI>75 and dropping, SHORT when RSI<25 and rising)
 
-CONFIRM if signal aligns with trend, has volume, good R:R, and no red flags.
+CONFIRM if EMA cross aligns with direction, RSI has momentum, volume confirms, and good R:R.
 
 Reply ONLY in this JSON format, nothing else:
 {{"decision": "CONFIRM" or "REJECT", "reason": "one sentence", "confidence": 0-100}}"""
@@ -1056,7 +1080,8 @@ def run_once():
                         f"\n💰 *Position sizing* (${balance:,.0f} portfolio)\n"
                         f"Size: ${pos_usd:,.0f} ({qty:.4f} {coin_u})\n"
                         f"Risk: ${risk_usd:.0f} ({RISK_PER_TRADE_PCT:.0f}% of portfolio)\n"
-                        f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | SMA50:{fmt_price(best['sma50'])}\n"
+                        f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | EMA50:{fmt_price(best['ema50'])}\n"
+                        f"EMA cross: {best.get('ema_gap_pct', 0):+.2f}% gap\n"
                         f"Vol:{best['vol_ratio']:.1f}x | ATR4h:{fmt_price(best['atr'])} | {best['trend']}\n\n"
                         f"🤖 *LLM ({confidence}%):* {reason}\n"
                         f"_Auto-executing via trade executor..._"
@@ -1073,7 +1098,8 @@ def run_once():
                     f"\n💰 *Position sizing* (${balance:,.0f} portfolio)\n"
                     f"Size: ${pos_usd:,.0f} ({qty:.4f} {coin_u})\n"
                     f"Risk: ${risk_usd:.0f} ({RISK_PER_TRADE_PCT:.0f}% of portfolio)\n"
-                    f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | SMA50:{fmt_price(best['sma50'])}\n"
+                    f"\nRSI:{best['rsi']:.0f} (Δ{rsi_delta:+.0f}) | EMA20:{fmt_price(best['ema20'])} | EMA50:{fmt_price(best['ema50'])}\n"
+                    f"EMA cross: {best.get('ema_gap_pct', 0):+.2f}% gap\n"
                     f"Vol:{best['vol_ratio']:.1f}x | ATR4h:{fmt_price(best['atr'])} | {best['trend']}\n\n"
                     f"_Awaiting LLM news review (next cron cycle)_"
                 )
@@ -1140,49 +1166,49 @@ def print_status():
         if bo and bd and not entry:
             print(f"  Breakout: >${bo:,.2f} | Breakdown: <${bd:,.2f} (auto from 7D range)")
 
-        # Signal eligibility check
         rsi = ind.get("rsi")
-        ema = ind.get("ema20")
-        sma = ind.get("sma50")
+        ema_f = ind.get("ema20")
+        ema_s = ind.get("ema50")
         vr = ind.get("vol_ratio")
         atr_val = ind.get("atr")
-        if rsi and ema and sma and vr and atr_val:
+        if rsi and ema_f and ema_s and vr and atr_val:
             rsi_prev = ind.get("rsi_prev")
             rsi_d = (rsi - rsi_prev) if rsi_prev else 0
+            ema_gap = (ema_f - ema_s) / ema_s * 100 if ema_s else 0
 
             rsi_cross_up = rsi_prev is not None and rsi_prev < RSI_OVERSOLD and rsi >= RSI_OVERSOLD
             rsi_strong_bull = rsi > RSI_LONG_MIN and rsi_d >= RSI_MOMENTUM_DELTA
             rsi_long_ok = rsi_cross_up or rsi_strong_bull
-            long_ema = price > ema
-            long_sma = price > sma
+            ema_bull = ema_f > ema_s
+            p_above_ema = price > ema_f
             vol_ok = vr >= VOLUME_CONFIRM_RATIO
-            trend_bull = ind.get("trend", "") in ("UPTREND", "SIDEWAYS-BULL")
+            trend_bull = ind.get("trend", "") == "UPTREND"
             rsi_tag = "cross↑30" if rsi_cross_up else (f"Δ{rsi_d:+.0f}" if rsi_strong_bull else f"✗Δ{rsi_d:+.0f}")
             checks = [
+                f"EMAx:{'Y' if ema_bull else 'N'}({ema_gap:+.2f}%)",
+                f"P>EMA20:{'Y' if p_above_ema else 'N'}",
                 f"RSI:{rsi:.0f}({rsi_tag}):{'Y' if rsi_long_ok else 'N'}",
-                f"P>EMA:{'Y' if long_ema else 'N'}",
-                f"P>SMA:{'Y' if long_sma else 'N'}",
                 f"Vol:{vr:.1f}x:{'Y' if vol_ok else 'N'}",
                 f"Trend:{'Y' if trend_bull else 'N'}",
             ]
-            all_pass = rsi_long_ok and long_ema and long_sma and vol_ok and trend_bull
+            all_pass = ema_bull and p_above_ema and rsi_long_ok and vol_ok and trend_bull
             print(f"  LONG:  {' | '.join(checks)} → {'PASS' if all_pass else 'NO'}")
 
             rsi_cross_dn = rsi_prev is not None and rsi_prev > RSI_OVERBOUGHT and rsi <= RSI_OVERBOUGHT
             rsi_strong_bear = rsi < RSI_SHORT_MAX and rsi_d <= -RSI_MOMENTUM_DELTA
             rsi_short_ok = rsi_cross_dn or rsi_strong_bear
-            short_ema = price < ema
-            short_sma = price < sma
-            trend_bear = ind.get("trend", "") in ("DOWNTREND", "SIDEWAYS-BEAR")
+            ema_bear = ema_f < ema_s
+            p_below_ema = price < ema_f
+            trend_bear = ind.get("trend", "") == "DOWNTREND"
             rsi_tag_s = "cross↓70" if rsi_cross_dn else (f"Δ{rsi_d:+.0f}" if rsi_strong_bear else f"✗Δ{rsi_d:+.0f}")
             checks_s = [
+                f"EMAx:{'Y' if ema_bear else 'N'}({ema_gap:+.2f}%)",
+                f"P<EMA20:{'Y' if p_below_ema else 'N'}",
                 f"RSI:{rsi:.0f}({rsi_tag_s}):{'Y' if rsi_short_ok else 'N'}",
-                f"P<EMA:{'Y' if short_ema else 'N'}",
-                f"P<SMA:{'Y' if short_sma else 'N'}",
                 f"Vol:{vr:.1f}x:{'Y' if vol_ok else 'N'}",
                 f"Trend:{'Y' if trend_bear else 'N'}",
             ]
-            all_pass_s = rsi_short_ok and short_ema and short_sma and vol_ok and trend_bear
+            all_pass_s = ema_bear and p_below_ema and rsi_short_ok and vol_ok and trend_bear
             print(f"  SHORT: {' | '.join(checks_s)} → {'PASS' if all_pass_s else 'NO'}")
 
             if atr_val:
@@ -1209,10 +1235,10 @@ def daemon_loop():
     balance = get_portfolio_balance()
     auto_trade = cfg("AUTO_TRADE_ENABLED", "false").lower() in ("true", "1", "yes")
     mode = "AUTO-TRADE (direct execute)" if auto_trade else "MANUAL (LLM review)"
-    print(f"[daemon] Binance price alert v6 — every {interval}s — {mode}")
+    print(f"[daemon] Binance price alert v7 (EMA cross) — every {interval}s — {mode}")
     print(f"[daemon] Monitoring {len(SYMBOLS)} coins: {coins_str}...")
-    print(f"[daemon] TA: RSI({RSI_PERIOD}), EMA({EMA_PERIOD}), SMA({SMA_PERIOD}), ATR({ATR_PERIOD})")
-    print(f"[daemon] Signal: SL={ATR_SL_MULT}xATR, TP={ATR_TP_MULT}xATR, R/R={ATR_TP_MULT/ATR_SL_MULT:.2f}")
+    print(f"[daemon] TA: RSI({RSI_PERIOD}), EMA({EMA_FAST_PERIOD}/{EMA_SLOW_PERIOD} cross), ATR({ATR_PERIOD})")
+    print(f"[daemon] Signal: STRICT EMA cross only (no SIDEWAYS), SL={ATR_SL_MULT}xATR, TP={ATR_TP_MULT}xATR")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:
