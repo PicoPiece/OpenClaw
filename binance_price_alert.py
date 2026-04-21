@@ -80,7 +80,8 @@ RSI_SHORT_MAX = 55
 RSI_MOMENTUM_DELTA = 3
 
 ATR_SL_MULT = 2.0
-ATR_TP_MULT = 3.5  # R:R 1.75 — buffer for 0.08% round-trip fee
+ATR_TP_MULT = 3.0  # R:R 1.5 — TP closer for higher win rate (per backtest v4 tune)
+VOL_STRONG_RATIO = 2.0  # threshold for "strong volume" override on SHORT
 
 # --- Portfolio Risk Management ---
 PORTFOLIO_BALANCE = float(os.environ.get("PORTFOLIO_BALANCE", "1000"))
@@ -586,12 +587,16 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         rsi_strong_bear = rsi < RSI_SHORT_MAX and rsi_delta <= -RSI_MOMENTUM_DELTA
         rsi_short_ok = rsi_cross_down or rsi_strong_bear
         # 4. Volume confirmation
-        # 5. Trend = DOWNTREND (price < EMA20 < EMA50)
-        trend_bearish = trend == "DOWNTREND"
-        # 6. Multi-timeframe: 4h EMA cross must also be BEARISH (or UNKNOWN if missing)
-        mtf_bearish = ema_cross_4h in ("BEARISH", "UNKNOWN")
+        # 5. Trend bearish: strict DOWNTREND OR (NEUTRAL-BEAR + RSI<35 OR strong vol)
+        # Rationale: EMA50 lags in downturns, so allow NEUTRAL-BEAR with strong confirm
+        rsi_low = rsi < 35
+        vol_strong = vol_ratio >= VOL_STRONG_RATIO
+        trend_bearish = trend == "DOWNTREND" or (
+            trend == "NEUTRAL-BEAR" and (rsi_low or vol_strong)
+        )
+        # 6. NO multi-timeframe requirement for SHORT (4h lag hurts more than helps in bearish chop)
 
-        if ema_bearish and price_below_ema and rsi_short_ok and vol_ok and trend_bearish and mtf_bearish:
+        if ema_bearish and price_below_ema and rsi_short_ok and vol_ok and trend_bearish:
             entry = round(price, 6)
             sl = round(entry + ATR_SL_MULT * atr, 6)
             tp = round(entry - ATR_TP_MULT * atr, 6)
@@ -679,10 +684,14 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
 
     ema_cross_str = "BULLISH (EMA20>EMA50)" if ema20 > ema50 else "BEARISH (EMA20<EMA50)"
     ema_cross_4h_str = signal.get("ema_cross_4h", "UNKNOWN")
-    mtf_align = "ALIGNED" if (
-        (direction == "LONG" and ema_cross_4h_str == "BULLISH") or
-        (direction == "SHORT" and ema_cross_4h_str == "BEARISH")
-    ) else ("UNKNOWN" if ema_cross_4h_str == "UNKNOWN" else "DIVERGED")
+
+    if direction == "LONG":
+        mtf_align = "ALIGNED" if ema_cross_4h_str == "BULLISH" else (
+            "UNKNOWN" if ema_cross_4h_str == "UNKNOWN" else "DIVERGED"
+        )
+        mtf_note = f"4h EMA: {ema_cross_4h_str} (multi-tf: {mtf_align}) — REQUIRED for LONG"
+    else:
+        mtf_note = f"4h EMA: {ema_cross_4h_str} (informational only — SHORT does not require 4h confirm)"
 
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal and decide CONFIRM or REJECT.
 
@@ -690,22 +699,23 @@ SIGNAL: {coin} {direction}
 Entry: ${entry} | SL: ${sl} | TP: ${tp} | R:R: {rr}
 RSI(14): {rsi:.1f} (prev: {rsi_prev:.1f}, delta: {rsi-rsi_prev:+.1f})
 EMA20: ${ema20} | EMA50: ${ema50} | EMA cross 1h: {ema_cross_str} (gap: {ema_gap:+.2f}%)
-EMA cross 4h: {ema_cross_4h_str} (multi-timeframe: {mtf_align})
+{mtf_note}
 Volume ratio: {vol_ratio:.2f}x | ATR(4h): ${atr}
 Trend: {trend} | Strength: {strength}
 Currently {active_count} other positions open.
 
 REJECT if ANY of these:
-1. {direction} against EMA cross 1h (e.g. LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
+1. {direction} against EMA cross 1h (LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
 2. EMA gap too small (<0.1%) — cross not confirmed, high whipsaw risk
-3. Multi-timeframe DIVERGED — 4h trend opposes 1h signal (very risky)
+3. LONG with 4h DIVERGED (4h still BEARISH while 1h flips BULLISH — bull trap risk)
 4. Volume ratio < 1.0 (no volume confirmation)
-5. R:R < 1.5 after fees (need buffer for 0.08% round-trip taker fee)
+5. R:R < 1.3 after fees
 6. Already {active_count} positions open AND this is a MODERATE signal
-7. RSI in extreme zone for the direction (LONG with RSI>70, SHORT with RSI<30)
-8. {direction} against strong reversal (LONG when RSI>75 and dropping, SHORT when RSI<25 and rising)
+7. RSI in extreme zone for direction (LONG RSI>70, SHORT RSI<25)
+8. {direction} against strong reversal (LONG with RSI>75 dropping, SHORT with RSI<25 rising)
 
-CONFIRM if EMA cross 1h+4h ALIGNED with direction, RSI has momentum, volume confirms, R:R >= 1.5.
+CONFIRM if EMA cross 1h aligns, RSI has momentum, volume confirms.
+Note: SHORT does NOT need 4h alignment (4h EMA lags downturns); but 1h cross must be bearish.
 
 Reply ONLY in this JSON format, nothing else:
 {{"decision": "CONFIRM" or "REJECT", "reason": "one sentence", "confidence": 0-100}}"""
