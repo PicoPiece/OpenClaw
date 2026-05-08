@@ -219,14 +219,23 @@ Checks every 30 min using **live Binance wallet** (not stale state file):
 ### Brain 1: OpenClaw Bot (DeepSeek via Telegram)
 - **90% of daily interaction**
 - Always-on daemon (`telegram_bridge.py`)
-- Slash commands: `/status /wallet /asi /positions /signals /grids /pause /resume /tradectrl /briefing /memory /forget /help`
+- Slash commands: `/status /wallet /asi /positions /signals /grids /pause /resume /tradectrl /briefing /memory /forget /knowledge /help`
 - Free-text chat → DeepSeek with real-time system context
 - **Persistent conversation memory** (`data/telegram_memory.json`):
   - Last 12 turns kept verbatim
   - Older turns auto-compressed into bullet-point summary via DeepSeek
   - Session timeout: 30 min idle → marked as "resumed" (history kept, just flagged)
   - Use `/memory` to inspect, `/forget` to wipe
-- Cost: ~$1-3/mo (memory adds ~$0.5/mo for summarization)
+- **Knowledge base** (`KNOWLEDGE.md` + `knowledge_loader.py`):
+  - Ground truth document split into sections (CORE_IDENTITY, FUTURES_ALLOWLIST,
+    GRID_BOTS, RISK_SHIELDS, TRAILING_SL_TIERS, RISK_PARAMS, ASI_FORMULA,
+    LESSONS_LEARNED, OPERATIONAL_PLAYBOOK, FILE_PATHS, COMMON_QUESTIONS,
+    CONSTRAINTS)
+  - Always-included base pack (~1K tokens) injected into every prompt
+  - On-demand retrieval (~500 tokens) when query keywords match other sections
+  - Eliminates hallucination on system facts (allowlist coins, shield logic, etc.)
+  - Use `/knowledge` to inspect; edit `KNOWLEDGE.md` to update truth
+- Cost: ~$1-3/mo (knowledge adds ~$1/mo for extra prompt tokens)
 
 ### Brain 2: Strategist (Claude via Cursor)
 - **5-10% interaction** — major decisions
@@ -303,6 +312,7 @@ Net: -$5/mo
 ```
 openclaw/
 ├── README.md, MASTER_ARCHITECTURE.md       Documentation
+├── KNOWLEDGE.md                            Bot ground-truth knowledge base
 ├── docker-compose.yml, Dockerfile          Container setup
 ├── .env, .gitignore                        Config / git
 │
@@ -337,6 +347,7 @@ openclaw/
 ├── weekly_llm_review.py                    LLM tweaks proposal
 │
 ├── telegram_bridge.py                      Bidirectional Telegram <-> AI chat
+├── knowledge_loader.py                     Bot knowledge base loader (static + retrieval)
 ├── reports/
 │   ├── morning_briefing.py                 Daily 08:00 portfolio summary
 │   └── weekly_analysis.py                  Sunday 19:00 DeepSeek review

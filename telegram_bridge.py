@@ -254,9 +254,10 @@ def cmd_help() -> str:
         "  /resume     — Resume auto-trade",
         "  /tradectrl  — Show trading control config",
         "",
-        b("Memory:"),
+        b("Memory & Knowledge:"),
         "  /memory     — Xem conversation memory (summary + recent)",
         "  /forget     — Reset memory (start fresh chat)",
+        "  /knowledge  — Inspect knowledge base sections",
         "",
         b("Other:"),
         "  /briefing   — Generate morning briefing now",
@@ -531,34 +532,51 @@ def free_text_response(user_msg: str) -> str:
     mem = load_memory()
     sess_status = get_session_status()
 
+    try:
+        import knowledge_loader as kl
+        knowledge_block = kl.build_knowledge_block(user_msg, max_retrieved=2)
+        retrieved = [n for n, _ in kl.retrieve(user_msg, max_sections=2)]
+    except Exception as e:
+        knowledge_block = ""
+        retrieved = []
+        print(f"[knowledge load err] {e}")
+
     system_parts = [
         "Bạn là OpenClaw, AI trading co-pilot của user. Trả lời tiếng Việt, ngắn gọn.",
         "",
-        "CONTEXT HIỆN TẠI (live data, refresh mỗi turn):",
-        context,
+        "CRITICAL RULES:",
+        "- KHÔNG bịa fact. Mọi số liệu, coin, shield, tier phải khớp với KNOWLEDGE BASE bên dưới.",
+        "- Nếu user hỏi gì không có trong knowledge base hoặc live state, nói thẳng 'không chắc, kiểm tra /XXX command'.",
+        "- KHÔNG suy đoán dựa trên kiến thức chung về crypto khi mâu thuẫn với knowledge base.",
         "",
-        "ARCHITECTURE:",
-        "- Multi-Layer Portfolio: HODL Core (Earn), Grid Yield (4 Spot Grid bots: AAVE/DOT/XRP/AVAX), Active Futures (OpenClaw 11-coin allowlist), Reserve (Spot USDT)",
-        "- Goal: ASI >= 2.0 (profit >= 2x LLM infra cost) để self-fund.",
-        "- Trade-off: Conservative > aggressive. Patient > impulsive.",
+    ]
+    if knowledge_block:
+        system_parts.append(knowledge_block)
+        system_parts.append("")
+    system_parts += [
+        "# LIVE STATE (refreshed mỗi turn):",
+        context,
         "",
     ]
     if mem.get("summary"):
-        system_parts.append("PREVIOUS CONVERSATION SUMMARY (older turns, compressed):")
+        system_parts.append("# PREVIOUS CONVERSATION SUMMARY (older turns, compressed):")
         system_parts.append(mem["summary"])
         system_parts.append("")
     if sess_status.startswith("resumed"):
         system_parts.append(f"NOTE: User vừa quay lại sau idle ({sess_status}). Có thể greet ngắn nếu phù hợp.")
         system_parts.append("")
     system_parts += [
-        "GUIDELINES:",
+        "# RESPONSE GUIDELINES:",
         "- Trả lời <300 từ.",
         "- Dùng emoji vừa phải. KHÔNG markdown asterisks/underscores. KHÔNG HTML tags.",
         "- Khi propose action, đưa concrete numbers và reasoning.",
         "- Khi user hỏi confused, ask clarifying question.",
-        "- Có ngữ cảnh từ recent_turns + summary -> tham chiếu được tới chủ đề trước.",
+        "- Tham chiếu recent_turns + summary để follow-up tự nhiên.",
+        "- Nếu retrieved section không đủ trả lời, gợi ý slash command phù hợp.",
     ]
     system = "\n".join(system_parts)
+    if retrieved:
+        print(f"[knowledge] retrieved sections: {retrieved}")
 
     msgs = [{"role": "system", "content": system}]
     for t in mem.get("recent_turns", []):
@@ -613,6 +631,29 @@ def cmd_forget() -> str:
             "\n\n" + i("Next chat starts fresh (system context vẫn có, history thì không)."))
 
 
+def cmd_knowledge() -> str:
+    """Inspect knowledge base sections."""
+    try:
+        import knowledge_loader as kl
+        secs = kl.all_sections()
+    except Exception as e:
+        return f"❌ Knowledge load err: {e}"
+    if not secs:
+        return "❌ KNOWLEDGE.md not found or empty"
+    lines = [b("📚 Knowledge Base")]
+    base_set = set(kl.BASE_SECTIONS)
+    total = 0
+    for name, body in secs.items():
+        chars = len(body)
+        total += chars
+        tag = " (always)" if name in base_set else " (on-demand)"
+        lines.append(f"  • {html_escape(name)}: {chars} chars{tag}")
+    lines.append("")
+    lines.append(f"Total: {total} chars (~{total//4} tokens)")
+    lines.append(i("Bot dùng base sections + retrieve query-relevant sections."))
+    return "\n".join(lines)
+
+
 # =============================================================================
 # Commands registry (must be after all cmd_* defs)
 # =============================================================================
@@ -631,6 +672,8 @@ COMMANDS = {
     "/briefing": cmd_briefing,
     "/memory": cmd_memory,
     "/forget": cmd_forget,
+    "/knowledge": cmd_knowledge,
+    "/kb": cmd_knowledge,
 }
 
 
