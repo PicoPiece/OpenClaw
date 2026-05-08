@@ -41,6 +41,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN
 
+try:
+    import decision_logger
+except Exception as _dl_err:
+    decision_logger = None
+    print(f"[WARN] decision_logger unavailable: {_dl_err}")
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 TRADING_STATE_FILE = SCRIPT_DIR / "data" / "workspace-finance" / "trading_state.json"
@@ -63,12 +69,18 @@ FUTURES_SYMBOL_MAP = {
 }
 
 # Trailing SL tiers: (min_profit_atr_mult, sl_offset_atr_mult, tier_name)
+# - BREAKEVEN/TRAIL_1..3: anchor to ENTRY (lock partial profit)
+# - CHASE_*: anchor to CURRENT price (continuous trailing at high profits)
 TRAIL_TIERS = [
-    (2.5, 1.5, "TRAIL_3"),
+    (5.0, 0.8, "CHASE_TIGHT"),  # Gap 3 (2026-05-05): profit >= 5 ATR → SL = current ± 0.8 ATR (was 4 ATR / 1.0)
+    (3.0, 1.5, "CHASE_WIDE"),   # profit >= 3 ATR → SL = current ± 1.5 ATR (chase, wider)
+    (2.5, 1.5, "TRAIL_3"),      # profit >= 2.5 ATR → SL = entry ± 1.5 ATR
     (2.0, 1.0, "TRAIL_2"),
     (1.5, 0.5, "TRAIL_1"),
-    (1.0, 0.0, "BREAKEVEN"),  # 0.0 = entry + fee buffer
+    (1.0, 0.0, "BREAKEVEN"),    # 0.0 = entry + fee buffer
+    (0.7, -0.5, "EARLY_LOCK"),  # Gap 1 (2026-05-05): profit >= 0.7 ATR → SL = entry - 0.5 ATR (giảm 75% rủi ro vùng "no man's land")
 ]
+CHASE_TIERS = {"CHASE_TIGHT", "CHASE_WIDE"}
 
 ATR_PERIOD = 14
 ATR_KLINES_INTERVAL = "4h"
@@ -82,7 +94,14 @@ FEE_BUFFER_MULT = 3   # breakeven SL includes 3x round-trip fee as buffer
 
 DEFAULT_PM_INTERVAL = 180     # 3 minutes
 DEFAULT_PM_COOLDOWN = 30      # 30 min cooldown per coin
-PARTIAL_CLOSE_PCT = 50        # close 50% on partial
+PARTIAL_CLOSE_PCT = 50        # close 50% on partial (LLM-driven path)
+
+# Gap 2 (2026-05-05): Auto partial close (deterministic, no LLM gate)
+# Triggered đúng khi profit_atr lần đầu vượt threshold. Track per-position để chỉ fire 1 lần/level.
+AUTO_PARTIAL_LEVELS = [
+    {"trigger_atr": 2.0, "close_pct": 30, "label": "PROFIT_LOCK_2X"},
+    {"trigger_atr": 3.0, "close_pct": 30, "label": "PROFIT_LOCK_3X"},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -292,33 +311,66 @@ def binance_api(method: str, url: str, params: dict) -> dict:
 
 
 def cancel_algo_order(algo_id: int) -> dict:
-    return binance_api("DELETE", BINANCE_FUTURES_ALGO, {"algoId": algo_id})
+    """Cancel an algo (CONDITIONAL) order. SDK auto-routes by orderId."""
+    try:
+        from binance.client import Client
+        c = Client(os.environ.get("BINANCE_API_KEY",""), os.environ.get("BINANCE_API_SECRET",""))
+        return c.futures_cancel_order(symbol=None, orderId=algo_id)
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def place_sl_order(symbol: str, side: str, stop_price: str) -> dict:
-    """Place a new SL algo order (STOP_MARKET with closePosition)."""
-    return binance_api("POST", BINANCE_FUTURES_ALGO, {
-        "symbol": symbol,
-        "side": side,
-        "algoType": "CONDITIONAL",
-        "orderType": "STOP_MARKET",
-        "stopPrice": stop_price,
-        "closePosition": "true",
-        "workingType": "MARK_PRICE",
-    })
+def _sdk():
+    from binance.client import Client
+    return Client(os.environ.get("BINANCE_API_KEY",""), os.environ.get("BINANCE_API_SECRET",""))
 
 
-def place_tp_order(symbol: str, side: str, stop_price: str) -> dict:
-    """Place a new TP algo order (TAKE_PROFIT_MARKET with closePosition)."""
-    return binance_api("POST", BINANCE_FUTURES_ALGO, {
-        "symbol": symbol,
-        "side": side,
-        "algoType": "CONDITIONAL",
-        "orderType": "TAKE_PROFIT_MARKET",
-        "stopPrice": stop_price,
-        "closePosition": "true",
-        "workingType": "MARK_PRICE",
-    })
+def place_sl_order(symbol: str, side: str, stop_price: str, qty: str | None = None) -> dict:
+    """Place a new SL (STOP_MARKET reduceOnly via algo order endpoint)."""
+    try:
+        c = _sdk()
+        params = {
+            "symbol": symbol, "side": side, "type": "STOP_MARKET",
+            "stopPrice": stop_price, "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }
+        if qty:
+            params["quantity"] = qty
+        else:
+            pos = c.futures_position_information(symbol=symbol)
+            amt = abs(float(pos[0]["positionAmt"])) if pos else 0
+            if amt <= 0:
+                return {"error": "no open position"}
+            params["quantity"] = str(amt)
+        r = c.futures_create_order(**params)
+        if "algoId" in r and "orderId" not in r:
+            r["orderId"] = r["algoId"]
+        return r
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def place_tp_order(symbol: str, side: str, stop_price: str, qty: str | None = None) -> dict:
+    """Place a new TP (TAKE_PROFIT_MARKET reduceOnly via algo order endpoint)."""
+    try:
+        c = _sdk()
+        params = {
+            "symbol": symbol, "side": side, "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": stop_price, "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }
+        if qty:
+            params["quantity"] = qty
+        else:
+            pos = c.futures_position_information(symbol=symbol)
+            amt = abs(float(pos[0]["positionAmt"])) if pos else 0
+            if amt <= 0:
+                return {"error": "no open position"}
+            params["quantity"] = str(amt)
+        r = c.futures_create_order(**params)
+        if "algoId" in r and "orderId" not in r:
+            r["orderId"] = r["algoId"]
+        return r
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def market_close_partial(symbol: str, side: str, qty: str) -> dict:
@@ -414,6 +466,9 @@ DECISION RULES:
 Reply ONLY in this JSON format:
 {{"action": "HOLD|TRAIL_SL|PARTIAL_CLOSE|CLOSE", "reason": "one sentence", "confidence": 0-100, "new_sl": {suggested_new_sl:.6f}, "close_pct": {PARTIAL_CLOSE_PCT}}}"""
 
+    raw_response = ""
+    tokens_in = tokens_out = None
+    review: dict = {}
     try:
         body = json.dumps({
             "model": "deepseek-chat",
@@ -433,7 +488,11 @@ Reply ONLY in this JSON format:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
 
+        usage = result.get("usage", {}) if isinstance(result, dict) else {}
+        tokens_in = usage.get("prompt_tokens")
+        tokens_out = usage.get("completion_tokens")
         content = result["choices"][0]["message"]["content"].strip()
+        raw_response = content
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -445,11 +504,40 @@ Reply ONLY in this JSON format:
         if action not in ("HOLD", "TRAIL_SL", "PARTIAL_CLOSE", "CLOSE"):
             action = "HOLD"
         review["action"] = action
-        return review
-
     except Exception as e:
         log(f"  LLM review error: {e} — defaulting to rule-based")
-        return {"action": "HOLD", "reason": f"API error: {e}", "confidence": 0}
+        review = {"action": "HOLD", "reason": f"API error: {e}", "confidence": 0}
+        raw_response = raw_response or f"ERROR: {e}"
+
+    if decision_logger is not None:
+        try:
+            decision_id = decision_logger.log_decision(
+                source="position_mgmt",
+                coin=coin.lower(),
+                direction=direction,
+                model="deepseek-chat",
+                prompt=prompt,
+                response=raw_response,
+                decision=review.get("action", "HOLD"),
+                reason=review.get("reason", ""),
+                confidence=review.get("confidence", 0),
+                indicators={
+                    "entry": entry, "current": current, "sl": sl, "tp": tp,
+                    "atr": atr, "rsi": rsi, "profit_atr": profit_atr,
+                    "current_tier": current_tier,
+                    "suggested_new_sl": suggested_new_sl,
+                    "fill_qty": fill_qty,
+                },
+                market_state={"position_value_usd": fill_qty * current},
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                prompt_version="position_mgmt_v1",
+            )
+            review["decision_id"] = decision_id
+        except Exception as e:
+            log(f"  [WARN] decision_logger.log_decision failed: {e}")
+
+    return review
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +564,13 @@ def calculate_trail_tier(direction: str, entry: float, current: float,
 
     for min_atr, sl_offset, tier_name in TRAIL_TIERS:
         if profit_atr >= min_atr:
-            if sl_offset == 0.0:
+            if tier_name in CHASE_TIERS:
+                # Continuous chase: anchor to CURRENT price, not entry
+                if direction == "LONG":
+                    new_sl = current - sl_offset * atr
+                else:
+                    new_sl = current + sl_offset * atr
+            elif sl_offset == 0.0:
                 # Breakeven: entry + fee buffer
                 if direction == "LONG":
                     new_sl = entry + fee_buffer
@@ -561,10 +655,10 @@ def execute_trail_sl(coin: str, cs: dict, symbol: str, new_sl: float,
                 send_telegram(msg)
         return False
 
-    new_sl_id = str(r.get("algoId", ""))
+    new_sl_id = str(r.get("algoId") or r.get("orderId") or "")
     cs["sl_price"] = float(new_sl_str)
     cs["sl_order_id"] = new_sl_id
-    log(f"  New SL placed: {new_sl_str} (algo #{new_sl_id})")
+    log(f"  New SL placed: {new_sl_str} (id #{new_sl_id})")
     return True
 
 
@@ -713,6 +807,40 @@ def place_new_sl_tp(cs: dict, symbol: str, direction: str, sl_price: float, tp_p
 # Main management loop
 # ---------------------------------------------------------------------------
 
+def check_timeout(cs: dict, profit_atr: float) -> dict | None:
+    """Decide whether to close due to timeout.
+
+    Policy (profit-aware):
+    - If past timeout AND profit_atr > +0.3 → close to lock profit (TIMEOUT_PROFIT)
+    - If past timeout AND profit_atr in [-0.3, +0.3] → close at breakeven (TIMEOUT_BE)
+    - If past timeout AND profit_atr < -0.3 → close to free capital (TIMEOUT_LOSS)
+      (No "let SL hit" — user wants quick resolution)
+    - If timeout_at not set → ignore (legacy positions)
+
+    Returns dict {state, reason, hours} or None.
+    """
+    timeout_at_str = cs.get("timeout_at")
+    if not timeout_at_str:
+        return None
+    try:
+        timeout_at = datetime.fromisoformat(timeout_at_str)
+        signal_time_str = cs.get("signal_time") or cs.get("alerted_at") or cs.get("fill_time")
+        signal_time = datetime.fromisoformat(signal_time_str) if signal_time_str else timeout_at
+        now = datetime.now(timezone.utc)
+    except Exception:
+        return None
+    if now < timeout_at:
+        return None
+
+    held_hours = (now - signal_time).total_seconds() / 3600
+
+    if profit_atr > 0.3:
+        return {"state": "TIMEOUT_PROFIT", "reason": f"timeout, profit {profit_atr:.2f}x ATR — lock", "hours": held_hours}
+    if profit_atr > -0.3:
+        return {"state": "TIMEOUT_BE", "reason": f"timeout, near breakeven ({profit_atr:+.2f}x ATR) — free capital", "hours": held_hours}
+    return {"state": "TIMEOUT_LOSS", "reason": f"timeout, lossing {profit_atr:+.2f}x ATR — cut loss before SL", "hours": held_hours}
+
+
 def manage_positions():
     """Check all ACTIVE positions and manage SL trailing / partial close."""
     trading_state = load_trading_state()
@@ -773,12 +901,76 @@ def manage_positions():
         )
 
         rsi_str = f"{rsi:.0f}" if rsi else "N/A"
-        log(f"  {coin.upper()} {direction} | Entry: {fmt_price(entry)} | Now: {fmt_price(current_price)} | "
+        mode = cs.get("mode", "?")
+        log(f"  {coin.upper()} {direction} [{mode}] | Entry: {fmt_price(entry)} | Now: {fmt_price(current_price)} | "
             f"P&L: {pnl_pct:+.2f}% ({profit_atr:.2f}x ATR) | RSI: {rsi_str} | "
             f"Tier: {tier_name}")
 
+        timeout_action = check_timeout(cs, profit_atr)
+        if timeout_action:
+            log(f"  ⏰ TIMEOUT triggered ({timeout_action['hours']:.1f}h held / {cs.get('timeout_h','?')}h limit) → {timeout_action['reason']}")
+            net_pnl = execute_full_close(coin, cs, symbol, direction, current_price)
+            mark_action(pm_state, coin)
+            cs["state"] = timeout_action["state"]
+            cs["closed_at"] = datetime.now(timezone.utc).isoformat()
+            cs["close_reason"] = timeout_action["reason"]
+            cs["close_price"] = current_price
+            cs["pnl_usd"] = round(net_pnl, 4)
+            save_trading_state(trading_state)
+            actions_taken += 1
+            msg = (
+                f"⏰ *[TIMEOUT CLOSE] {coin.upper()} {direction}* [{mode}]\n"
+                f"Held: {timeout_action['hours']:.1f}h / limit {cs.get('timeout_h','?')}h\n"
+                f"Entry: {fmt_price(entry)} | Exit: {fmt_price(current_price)}\n"
+                f"P&L: ${net_pnl:+.3f} ({pnl_pct:+.2f}%, {profit_atr:.2f}x ATR)\n\n"
+                f"Reason: {timeout_action['reason']}"
+            )
+            send_telegram(msg)
+            continue
+
+        # Gap 2: Auto partial close (deterministic, before LLM consult)
+        partials_taken = cs.setdefault("partials_taken", [])
+        auto_partial_fired = False
+        for lvl in AUTO_PARTIAL_LEVELS:
+            if profit_atr < lvl["trigger_atr"]:
+                continue
+            if lvl["label"] in partials_taken:
+                continue
+            log(f"  ✂️ AUTO PARTIAL CLOSE — profit {profit_atr:.2f}x ATR >= {lvl['trigger_atr']} → close {lvl['close_pct']}% ({lvl['label']})")
+            net_pnl = execute_partial_close(coin, cs, symbol, lvl["close_pct"], direction, current_price)
+            if net_pnl != 0:
+                partials_taken.append(lvl["label"])
+                place_new_sl_tp(cs, symbol, direction, suggested_sl if tier_name != "NONE" else current_sl, current_tp)
+                mark_action(pm_state, coin)
+                save_trading_state(trading_state)
+                actions_taken += 1
+
+                es = load_executor_state()
+                es["daily_pnl"] = es.get("daily_pnl", 0) + net_pnl
+                es["total_pnl"] = es.get("total_pnl", 0) + net_pnl
+                es.setdefault("trade_history", []).append({
+                    "coin": coin, "direction": direction,
+                    "entry": entry, "close": current_price,
+                    "pnl": round(net_pnl, 4), "result": "PARTIAL_CLOSE",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "note": f"auto: {lvl['label']} @ {profit_atr:.2f}xATR",
+                })
+                save_executor_state(es)
+
+                send_telegram(
+                    f"✂️ *[AUTO PARTIAL] {coin.upper()} {direction}* ({lvl['label']})\n"
+                    f"Closed {lvl['close_pct']}% @ {fmt_price(current_price)}\n"
+                    f"Net P&L: *${net_pnl:+.4f}*\n"
+                    f"Profit: {profit_atr:.2f}x ATR | RSI: {rsi_str}\n"
+                    f"Remaining: {cs['fill_qty']:.4f} units"
+                )
+                auto_partial_fired = True
+                break  # only fire one level per cycle
+        if auto_partial_fired:
+            continue
+
         if tier_name == "NONE":
-            log(f"  → No trail action needed (profit {profit_atr:.2f}x ATR < 1.0 or SL already ahead)")
+            log(f"  → No trail action needed (profit {profit_atr:.2f}x ATR < 0.7 or SL already ahead)")
             continue
 
         # Consult LLM for final decision
@@ -1004,11 +1196,36 @@ def daemon_loop():
     log(f"Trail tiers: " + " | ".join(f"{t[2]}: >{t[0]}xATR→SL+{t[1]}xATR" for t in TRAIL_TIERS))
     log(f"Partial close: {PARTIAL_CLOSE_PCT}% | Fee: {TAKER_FEE_PCT}%")
 
+    last_linker = 0.0
+    last_binance_reconcile = 0.0
     while True:
         try:
             run_once()
         except Exception as exc:
             log(f"ERROR: {exc}")
+        try:
+            if time.time() - last_linker > 900:
+                import outcome_linker
+                out = outcome_linker.reconcile()
+                if out.get("updated") or out.get("inserted"):
+                    log(f"outcome_linker: {out}")
+                last_linker = time.time()
+        except Exception as exc:
+            log(f"outcome_linker error: {exc}")
+        try:
+            if time.time() - last_binance_reconcile > 3600:
+                import subprocess
+                r = subprocess.run(
+                    ["python3", str(Path(__file__).resolve().parent / "binance_reconcile.py"),
+                     "--apply", "--days", "3"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                tail = (r.stdout or "").splitlines()[-3:]
+                if tail:
+                    log("binance_reconcile: " + " | ".join(tail))
+                last_binance_reconcile = time.time()
+        except Exception as exc:
+            log(f"binance_reconcile error: {exc}")
         time.sleep(interval)
 
 

@@ -44,6 +44,14 @@ from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
 
+try:
+    import decision_logger
+except Exception as _dl_err:
+    decision_logger = None
+    print(f"[WARN] decision_logger unavailable: {_dl_err}")
+
+PENDING_SIGNAL_FILE = Path(__file__).resolve().parent / "data" / "pending_signal.json"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 TRADING_STATE_FILE = SCRIPT_DIR / "data" / "workspace-finance" / "trading_state.json"
@@ -300,18 +308,21 @@ class BinanceExecutor:
         sl_price_str = self.round_price(symbol, sl_price)
         tp_price_str = self.round_price(symbol, tp_price)
 
+        # NOTE: Binance requires reduceOnly+quantity (algo order) instead of
+        # closePosition=true on /fapi/v1/order for STOP_MARKET / TAKE_PROFIT_MARKET.
+        # The SDK auto-routes to the algo endpoint when reduceOnly is used.
         try:
             sl_order = self.client.futures_create_order(
                 symbol=symbol,
                 side=close_side,
                 type=FUTURE_ORDER_TYPE_STOP_MARKET,
                 stopPrice=sl_price_str,
-                closePosition="true",
-                timeInForce="GTC",
+                quantity=qty_str,
+                reduceOnly="true",
                 workingType="MARK_PRICE",
             )
-            sl_order_id = sl_order["orderId"]
-            log.info(f"SL order placed: {sl_price_str} — order {sl_order_id}")
+            sl_order_id = sl_order.get("orderId") or sl_order.get("algoId")
+            log.info(f"SL order placed: {sl_price_str} qty={qty_str} — id {sl_order_id}")
         except BinanceAPIException as exc:
             log.error(f"Failed to place SL order: {exc}")
 
@@ -321,12 +332,12 @@ class BinanceExecutor:
                 side=close_side,
                 type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                 stopPrice=tp_price_str,
-                closePosition="true",
-                timeInForce="GTC",
+                quantity=qty_str,
+                reduceOnly="true",
                 workingType="MARK_PRICE",
             )
-            tp_order_id = tp_order["orderId"]
-            log.info(f"TP order placed: {tp_price_str} — order {tp_order_id}")
+            tp_order_id = tp_order.get("orderId") or tp_order.get("algoId")
+            log.info(f"TP order placed: {tp_price_str} qty={qty_str} — id {tp_order_id}")
         except BinanceAPIException as exc:
             log.error(f"Failed to place TP order: {exc}")
 
@@ -463,7 +474,13 @@ def process_new_signals(executor: BinanceExecutor, trading_state: dict,
         sl = cs["sl_price"]
         tp = cs["tp_price"]
 
-        balance = float(cfg("PORTFOLIO_BALANCE", "100"))
+        try:
+            from binance_price_alert import get_portfolio_balance as _gpb
+            balance = _gpb()
+        except Exception:
+            balance = float(cfg("PORTFOLIO_BALANCE", "100"))
+        if balance <= 0:
+            balance = float(cfg("PORTFOLIO_BALANCE", "100"))
         risk_pct = 2.0
         risk_per_unit = abs(entry - sl)
         if risk_per_unit == 0:
@@ -479,6 +496,50 @@ def process_new_signals(executor: BinanceExecutor, trading_state: dict,
         if result:
             cs.update(result)
             cs["executed_at"] = datetime.now(timezone.utc).isoformat()
+
+            decision_id = None
+            try:
+                if PENDING_SIGNAL_FILE.exists():
+                    pending = json.loads(PENDING_SIGNAL_FILE.read_text())
+                    if pending.get("coin") == coin and pending.get("direction") == direction:
+                        decision_id = pending.get("decision_id")
+            except Exception:
+                pass
+
+            if decision_logger is not None:
+                try:
+                    trade_id = decision_logger.log_trade_open(
+                        coin=coin,
+                        direction=direction,
+                        entry_price=result["fill_price"] or entry,
+                        sl_price=sl,
+                        tp_price=tp,
+                        qty=result["fill_qty"],
+                        position_usd=result["fill_price"] * result["fill_qty"]
+                            if result.get("fill_price") else None,
+                        risk_usd=max_risk_usd,
+                        leverage=executor.leverage,
+                        signal_decision_id=decision_id,
+                        notes=f"strategy=ema_trend_v1 order_id={result.get('order_id')} sl_id={result.get('sl_order_id')} tp_id={result.get('tp_order_id')}",
+                        indicators={"signal_strength": cs.get("signal_strength")},
+                        market_state={"testnet": executor.testnet},
+                        mode=cs.get("mode"),
+                        timeout_h=cs.get("timeout_h"),
+                        sl_mult=cs.get("sl_mult"),
+                        tp_mult=cs.get("tp_mult"),
+                    )
+                    cs["trade_id"] = trade_id
+                    if result.get("fill_price"):
+                        decision_logger.log_slippage(
+                            trade_id=trade_id, coin=coin,
+                            side="BUY" if direction == "LONG" else "SELL",
+                            expected_price=entry,
+                            actual_price=result["fill_price"],
+                            qty=result["fill_qty"],
+                        )
+                except Exception as e:
+                    log.warning(f"decision_logger trade open failed: {e}")
+
             save_trading_state(trading_state)
 
             pnl_at_tp = abs(tp - result["fill_price"]) * result["fill_qty"]
@@ -515,11 +576,8 @@ def check_position_status(executor: BinanceExecutor, trading_state: dict,
     exchange_positions = executor.get_open_positions()
     closed = 0
 
-    skip_order_ids = {"synced_from_exchange", "manual_sync"}
     for coin, cs in states.items():
         if cs.get("state") != "ACTIVE" or not cs.get("order_id"):
-            continue
-        if cs.get("order_id") in skip_order_ids:
             continue
 
         symbol = FUTURES_SYMBOL_MAP.get(coin)
@@ -597,6 +655,17 @@ def check_position_status(executor: BinanceExecutor, trading_state: dict,
         if len(executor_state["trade_history"]) > 100:
             executor_state["trade_history"] = executor_state["trade_history"][-100:]
 
+        if decision_logger is not None and cs.get("trade_id"):
+            try:
+                decision_logger.log_trade_close(
+                    trade_id=cs["trade_id"],
+                    close_price=close_price or 0,
+                    result=new_state,
+                    pnl_usd=round(pnl, 4),
+                )
+            except Exception as e:
+                log.warning(f"decision_logger trade close failed: {e}")
+
         save_trading_state(trading_state)
         save_executor_state(executor_state)
 
@@ -647,16 +716,12 @@ def sync_positions(executor: BinanceExecutor, trading_state: dict):
         cs["order_id"] = "synced_from_exchange"
         cs["synced_at"] = datetime.now(timezone.utc).isoformat()
 
-    skip_ids = {"synced_from_exchange", "manual_sync"}
     for coin, cs in states.items():
         if cs.get("state") != "ACTIVE" or not cs.get("order_id"):
             continue
-        if cs.get("order_id") in skip_ids:
-            continue
         symbol = FUTURES_SYMBOL_MAP.get(coin)
         if symbol and symbol not in exchange:
-            log.warning(f"Local ACTIVE {coin.upper()} but no exchange position — marking SL_HIT")
-            cs["state"] = "SL_HIT"
+            log.warning(f"Local ACTIVE {coin.upper()} but no exchange position — will reconcile via check_position_status")
 
     trading_state["states"] = states
     save_trading_state(trading_state)

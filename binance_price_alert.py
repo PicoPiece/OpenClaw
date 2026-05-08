@@ -26,8 +26,26 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+try:
+    import decision_logger
+except Exception as _dl_err:
+    decision_logger = None
+    print(f"[WARN] decision_logger unavailable: {_dl_err}")
+
+try:
+    import prompt_registry
+except Exception as _pr_err:
+    prompt_registry = None
+    print(f"[WARN] prompt_registry unavailable: {_pr_err}")
+
+try:
+    import rag_memory
+except Exception as _rm_err:
+    rag_memory = None
+    print(f"[WARN] rag_memory unavailable: {_rm_err}")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_FILE = SCRIPT_DIR / "data" / "price_alert_state.json"
@@ -42,7 +60,7 @@ BINANCE_24H_API = "https://api.binance.com/api/v3/ticker/24hr"
 
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 TOP_N_COINS = 20
-MIN_VOLUME_USD = 50_000_000  # raised from 20M for higher quality
+MIN_VOLUME_USD = 10_000_000  # lowered to allow ~36 candidates → top 20 selected
 STABLECOIN_BLACKLIST = {"USDC", "USDT", "FDUSD", "TUSD", "DAI", "BUSD", "USD1", "RLUSD",
                          "USDP", "PYUSD", "AEUR", "EURI", "EUROC", "EUR", "GBP", "BRL",
                          "PAXG", "WBTC", "WBETH", "STETH", "CBBTC", "WETH", "U"}
@@ -85,8 +103,45 @@ VOL_STRONG_RATIO = 2.0  # threshold for "strong volume" override on SHORT
 
 # --- Portfolio Risk Management ---
 PORTFOLIO_BALANCE = float(os.environ.get("PORTFOLIO_BALANCE", "1000"))
-RISK_PER_TRADE_PCT = 2.0      # max 2% of portfolio risked per trade
-MAX_PORTFOLIO_RISK_PCT = 10.0  # max 10% total open risk across all positions
+RISK_PER_TRADE_PCT = 3.0      # max 3% of portfolio risked per trade (raised 2026-05-05 after 12d/13t observation, WR 69%)
+MAX_PORTFOLIO_RISK_PCT = 12.0  # max 12% total open risk across all positions (raised to keep 4 concurrent slots)
+
+# --- Signal quality filters (per backtest v6: +24.65R lift) ---
+# Coin allowlist: only emit signals on these coins (set empty to disable).
+# Default = top performers from 30d backtest (>=46% win rate or positive R).
+# Override via env: COIN_ALLOWLIST="aave,eth,btc"
+_default_allowlist = "aave,eth,link,bnb,xrp,btc,trx,inj,ordi,atom,ena"
+COIN_ALLOWLIST = {
+    c.strip().lower() for c in
+    os.environ.get("COIN_ALLOWLIST", _default_allowlist).split(",")
+    if c.strip()
+}
+
+# Shield 1: per-coin health auto-suspend
+_SUSPENSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "data", "coin_suspensions.json")
+_suspensions_cache = {"loaded_at": 0, "set": set()}
+
+def _suspended_coins() -> set[str]:
+    """Re-read suspensions file every 60s. Returns set of suspended coin tickers (lowercase)."""
+    import time as _t
+    now = _t.time()
+    if now - _suspensions_cache["loaded_at"] < 60:
+        return _suspensions_cache["set"]
+    suspended = set()
+    try:
+        if os.path.exists(_SUSPENSIONS_FILE):
+            with open(_SUSPENSIONS_FILE) as f:
+                data = json.load(f)
+            suspended = {c.lower() for c in (data.get("suspensions") or {}).keys()}
+    except Exception:
+        pass
+    _suspensions_cache["set"] = suspended
+    _suspensions_cache["loaded_at"] = now
+    return suspended
+# Volatility regime filter: skip signal if ATR/price > VOL_REGIME_MAX_PCT.
+# Default 2.5 (loose — most live signals pass; tighten to 2.0 for stricter).
+VOL_REGIME_MAX_PCT = float(os.environ.get("VOL_REGIME_MAX_PCT", "2.5"))
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +369,23 @@ def fetch_klines(symbol: str) -> dict:
 
     ema_gap_pct = ((ema_fast - ema_slow) / ema_slow * 100) if ema_fast and ema_slow and ema_slow != 0 else 0
 
+    # Gap 4 (2026-05-05): Explosive breakout detection on last 1h bar
+    explosive_burst = False
+    burst_direction = None
+    last_bar_range_atr = 0.0
+    last_bar_vol_ratio = 0.0
+    if len(raw) >= 2 and atr_1h:
+        last_bar = raw[-1]
+        last_high = float(last_bar[2]); last_low = float(last_bar[3])
+        last_open = float(last_bar[1]); last_close = float(last_bar[4])
+        last_vol = float(last_bar[5])
+        avg_vol_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else (volumes[-1] or 1)
+        last_bar_range_atr = (last_high - last_low) / atr_1h
+        last_bar_vol_ratio = (last_vol / avg_vol_20) if avg_vol_20 > 0 else 0
+        if last_bar_range_atr >= 1.5 and last_bar_vol_ratio >= 3.0:
+            explosive_burst = True
+            burst_direction = "LONG" if last_close > last_open else "SHORT"
+
     return {
         "price": price,
         "rsi": rsi_now,
@@ -335,6 +407,11 @@ def fetch_klines(symbol: str) -> dict:
         "breakdown": levels["breakdown"],
         "high_7d": levels["high_7d"],
         "low_7d": levels["low_7d"],
+        # Gap 4: Explosive burst signal
+        "explosive_burst": explosive_burst,
+        "burst_direction": burst_direction,
+        "last_bar_range_atr": round(last_bar_range_atr, 2),
+        "last_bar_vol_ratio": round(last_bar_vol_ratio, 2),
     }
 
 
@@ -419,9 +496,58 @@ def is_signal_on_cooldown(alert_state: dict, coin: str, cooldown_h: int) -> bool
     return (time.time() - last_ts) < cooldown_h * 3600
 
 
+_LIVE_BAL_CACHE = {"ts": 0.0, "value": 0.0}
+
+
+def _live_futures_balance(ttl: int = 60) -> float:
+    """Fetch live USDT futures wallet balance with short TTL cache.
+    Returns 0.0 on any failure so caller can fall back to env."""
+    now = time.time()
+    if now - _LIVE_BAL_CACHE["ts"] < ttl and _LIVE_BAL_CACHE["value"] > 0:
+        return _LIVE_BAL_CACHE["value"]
+    try:
+        import hmac, hashlib, urllib.parse
+        api_key = os.environ.get("BINANCE_API_KEY", "")
+        api_secret = os.environ.get("BINANCE_API_SECRET", "")
+        if not api_key or not api_secret:
+            return 0.0
+        params = urllib.parse.urlencode({"timestamp": int(now * 1000)})
+        sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+        url = f"https://fapi.binance.com/fapi/v2/account?{params}&signature={sig}"
+        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        bal = float(data.get("totalWalletBalance", 0))
+        if bal > 0:
+            _LIVE_BAL_CACHE["ts"] = now
+            _LIVE_BAL_CACHE["value"] = bal
+        return bal
+    except Exception:
+        return 0.0
+
+
 def get_portfolio_balance() -> float:
-    """Read portfolio balance from env (reloaded each cycle so user can update .env live)."""
-    return float(os.environ.get("PORTFOLIO_BALANCE", str(PORTFOLIO_BALANCE)))
+    """Resolve portfolio balance for sizing.
+
+    Priority:
+      1. Live Binance Futures wallet (source of truth) × strategy slice pct.
+      2. Stale env PORTFOLIO_BALANCE × strategy slice pct.
+      3. Bare env value.
+    This prevents the historical 3x oversize bug caused by stale env."""
+    live = _live_futures_balance()
+    env_bal = float(os.environ.get("PORTFOLIO_BALANCE", str(PORTFOLIO_BALANCE)))
+    base = live if live > 0 else env_bal
+
+    try:
+        import strategy_portfolio
+        cfg = strategy_portfolio.load_portfolio()
+        for s in cfg.get("strategies", []):
+            if s.get("slug") == "ema_trend_v1" and s.get("active"):
+                pct = float(s.get("target_pct", 0.7))
+                return base * pct
+    except Exception:
+        pass
+    return base
 
 
 def calc_open_risk(trading_state: dict, prices: dict) -> tuple[float, list]:
@@ -494,6 +620,14 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         if symbol not in prices or symbol not in indicators:
             continue
 
+        # FILTER 1: coin allowlist (backtest v6: +24.65R)
+        if COIN_ALLOWLIST and coin.lower() not in COIN_ALLOWLIST:
+            continue
+
+        # FILTER 1b: Shield 1 — coin health auto-suspend
+        if coin.lower() in _suspended_coins():
+            continue
+
         coin_state = states.get(coin, {})
         has_position = bool(coin_state.get("entry_price"))
         current_state = coin_state.get("state", "")
@@ -521,9 +655,54 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         if rsi_prev is None:
             continue
 
+        # FILTER 2: volatility regime — skip extreme high-vol bars
+        atr_pct = atr / price * 100
+        if atr_pct > VOL_REGIME_MAX_PCT:
+            continue
+
         rsi_delta = rsi - rsi_prev
         vol_ok = vol_ratio >= VOLUME_CONFIRM_RATIO
         ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100 if ema_slow else 0
+
+        # Gap 4: Explosive breakout entry path (parallel to standard EMA-cross detection)
+        # Triggers ngay khi 1h candle range > 1.5 ATR + volume > 3x avg + 4h aligned
+        if ind.get("explosive_burst"):
+            burst_dir = ind.get("burst_direction")
+            mtf_aligned = (
+                (burst_dir == "LONG" and ema_cross_4h in ("BULLISH", "UNKNOWN")) or
+                (burst_dir == "SHORT" and ema_cross_4h in ("BEARISH", "UNKNOWN"))
+            )
+            if mtf_aligned:
+                entry_b = round(price, 6)
+                if burst_dir == "LONG":
+                    sl_b = round(entry_b - 0.8 * atr, 6)
+                    tp_b = round(entry_b + 2.5 * atr, 6)
+                else:
+                    sl_b = round(entry_b + 0.8 * atr, 6)
+                    tp_b = round(entry_b - 2.5 * atr, 6)
+                pos_b = calc_position_size(entry_b, sl_b, balance)
+                signals.append({
+                    "coin": coin, "symbol": symbol, "direction": burst_dir,
+                    "strength": "EXPLOSIVE", "mode_hint": "BREAKOUT",
+                    "entry": entry_b, "sl": sl_b, "tp": tp_b,
+                    "sl_pct": round(abs(entry_b - sl_b) / entry_b * 100, 2),
+                    "tp_pct": round(abs(tp_b - entry_b) / entry_b * 100, 2),
+                    "atr": round(atr, 6), "rsi": round(rsi, 1),
+                    "rsi_prev": round(rsi_prev, 1), "rsi_delta": round(rsi_delta, 1),
+                    "ema20": round(ema_fast, 6), "ema50": round(ema_slow, 6),
+                    "ema_gap_pct": round(ema_gap_pct, 3),
+                    "ema_cross_4h": ema_cross_4h,
+                    "vol_ratio": round(vol_ratio, 2),
+                    "trend": trend,
+                    "rr_ratio": round(2.5 / 0.8, 2),
+                    "position_usd": pos_b["position_usd"], "qty": pos_b["qty"],
+                    "risk_usd": pos_b["risk_usd"], "risk_pct": pos_b["risk_pct"],
+                    "burst_range_atr": ind.get("last_bar_range_atr"),
+                    "burst_vol_ratio": ind.get("last_bar_vol_ratio"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "pending_review",
+                })
+                continue  # explosive entry takes priority — skip EMA-cross detection this cycle
 
         # --- LONG rules (ALL must pass) ---
         # 1. EMA20 > EMA50 (bullish cross confirmed)
@@ -681,9 +860,80 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
     strength = signal.get("strength", "")
     rr = signal.get("rr_ratio", 0)
     atr = signal.get("atr", 0)
+    mode_hint = signal.get("mode_hint")  # Gap 4: "BREAKOUT" for explosive entries
+    burst_range_atr = signal.get("burst_range_atr")
+    burst_vol_ratio = signal.get("burst_vol_ratio")
 
     ema_cross_str = "BULLISH (EMA20>EMA50)" if ema20 > ema50 else "BEARISH (EMA20<EMA50)"
     ema_cross_4h_str = signal.get("ema_cross_4h", "UNKNOWN")
+
+    variant_name = os.environ.get("PROMPT_VARIANT", "A")
+    variant_version = "signal_review_v1"
+    variant_body_template: str | None = None
+    if prompt_registry is not None:
+        try:
+            v_name, v_version, body = prompt_registry.resolve_variant(
+                "signal_review", key=f"{coin}:{direction}",
+            )
+            variant_name = v_name or variant_name
+            variant_version = v_version or variant_version
+            if v_name and v_name != "A":
+                variant_body_template = body
+        except Exception as _e:
+            pass
+
+    few_shot = ""
+    rag_context_for_log = None
+    if os.environ.get("FEW_SHOT_ENABLED", "1") == "1":
+        try:
+            rag_summary = None
+            if rag_memory is not None:
+                rag_summary = rag_memory.query(
+                    direction=direction, rsi=rsi, ema_gap_pct=ema_gap,
+                    vol_ratio=vol_ratio, atr=atr, entry=entry, rr=rr,
+                    trend=trend, k=8,
+                )
+            if rag_summary and rag_summary.get("k"):
+                lines = [
+                    f"\nHISTORICAL CONTEXT (top {rag_summary['k']} similar past trades by feature-cosine):",
+                    f"  Win rate: {rag_summary['win_rate']}% | Avg R: {rag_summary['avg_r']} | Total P&L: ${rag_summary['total_pnl']:+.2f}",
+                ]
+                for m in rag_summary["matches"][:5]:
+                    rmul = m.get("r_multiple")
+                    rmul_str = f" R={rmul:+.2f}" if rmul is not None else ""
+                    lines.append(
+                        f"  - {(m['coin'] or '').upper()} {m['result'] or 'OPEN'} "
+                        f"${m['pnl_usd'] or 0:+.2f}{rmul_str} sim={m['similarity']:.2f}"
+                    )
+                few_shot = "\n".join(lines)
+                rag_context_for_log = rag_summary["matches"]
+            elif decision_logger is not None:
+                similar = decision_logger.query_similar_trades(
+                    coin=coin.lower(), direction=direction,
+                    rsi=rsi, ema_gap_pct=ema_gap, vol_ratio=vol_ratio, limit=4,
+                )
+                if similar:
+                    rag_context_for_log = []
+                    lines = ["\nHISTORICAL CONTEXT — past trades similar to this signal:"]
+                    for t in similar:
+                        pnl = t.get("pnl_usd") or 0
+                        res = t.get("result") or "OPEN"
+                        rmul = t.get("r_multiple")
+                        rmul_str = f" R={rmul:+.2f}" if rmul is not None else ""
+                        try:
+                            ind = json.loads(t.get("indicators_open_json") or "{}")
+                        except Exception:
+                            ind = {}
+                        rsi_v = ind.get("rsi")
+                        rsi_str_h = f"RSI {rsi_v:.0f}" if isinstance(rsi_v, (int, float)) else ""
+                        lines.append(f"  - {t['coin'].upper()} {t['direction']} → {res} P&L ${pnl:+.2f}{rmul_str} {rsi_str_h}")
+                        rag_context_for_log.append({
+                            "trade_id": t["id"], "result": res, "pnl": pnl,
+                            "r_multiple": rmul, "indicators": ind,
+                        })
+                    few_shot = "\n".join(lines)
+        except Exception as _e:
+            pass
 
     if direction == "LONG":
         mtf_align = "ALIGNED" if ema_cross_4h_str == "BULLISH" else (
@@ -693,33 +943,93 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
     else:
         mtf_note = f"4h EMA: {ema_cross_4h_str} (informational only — SHORT does not require 4h confirm)"
 
-    prompt = f"""You are a crypto futures trading risk analyst. Review this signal and decide CONFIRM or REJECT.
+    # Shield 3: coin tier (90d backtest evidence)
+    _COIN_TIER = {
+        "trx": ("A", "+9.39R 90d, win 2/3 regimes"),
+        "btc": ("A", "+4.94R 90d, win 2/3 regimes"),
+        "xrp": ("B", "-2.45R 90d, win only in W1 (uptrend weak)"),
+        "aave": ("B", "-2.39R 90d, win only in W2 (sideways)"),
+        "eth": ("C", "-6.74R 90d, lose all 3 regimes"),
+        "bnb": ("C", "-9.28R 90d, lose all 3 regimes"),
+        "link": ("C", "-14.71R 90d, biggest loser"),
+    }
+    _tier, _tier_note = _COIN_TIER.get(coin.lower(), ("?", "no backtest data"))
+    tier_block = (
+        f"COIN TIER: {_tier} — {_tier_note}\n"
+        f"  Tier A (TRX, BTC): proven winners — confirm with normal threshold.\n"
+        f"  Tier B (XRP, AAVE): regime-dependent — confirm only if 4h trend STRONGLY aligned AND volume > 1.3x.\n"
+        f"  Tier C (ETH, BNB, LINK): historical losers — REJECT unless ALL 3 conditions: RSI in optimal zone (40-65 LONG / 35-60 SHORT) AND 4h ALIGNED AND volume > 1.5x AND R:R >= 1.8."
+    )
+
+    breakout_block = ""
+    if mode_hint == "BREAKOUT":
+        breakout_block = (
+            f"\n⚡ EXPLOSIVE BREAKOUT DETECTED (last 1h candle): "
+            f"range = {burst_range_atr}× ATR (>= 1.5 threshold), "
+            f"volume = {burst_vol_ratio}× avg (>= 3.0 threshold)\n"
+            f"Pre-set mode: BREAKOUT (tight SL 0.8×ATR, wide TP 2.5×ATR, R:R 3.1)\n"
+            f"For BREAKOUT, IGNORE the SCALP/SWING/QUICK classification — return mode='BREAKOUT' "
+            f"with sl_mult=0.8, tp_mult=2.5, timeout_h=4. Confirm only if news/momentum genuine, "
+            f"reject if signs of fakeout (immediate price reversal, low follow-through volume).\n"
+        )
+
+    prompt = f"""You are a crypto futures trading risk analyst. Review this signal, decide CONFIRM/REJECT, and classify the trade MODE.
+
+{tier_block}{breakout_block}
 
 SIGNAL: {coin} {direction}
-Entry: ${entry} | SL: ${sl} | TP: ${tp} | R:R: {rr}
+Entry: ${entry} | Default SL: ${sl} | Default TP: ${tp} | R:R: {rr}
 RSI(14): {rsi:.1f} (prev: {rsi_prev:.1f}, delta: {rsi-rsi_prev:+.1f})
 EMA20: ${ema20} | EMA50: ${ema50} | EMA cross 1h: {ema_cross_str} (gap: {ema_gap:+.2f}%)
 {mtf_note}
 Volume ratio: {vol_ratio:.2f}x | ATR(4h): ${atr}
 Trend: {trend} | Strength: {strength}
-Currently {active_count} other positions open.
+Currently {active_count} other positions open.{few_shot}
 
 REJECT if ANY of these:
 1. {direction} against EMA cross 1h (LONG when EMA20<EMA50, SHORT when EMA20>EMA50)
 2. EMA gap too small (<0.1%) — cross not confirmed, high whipsaw risk
-3. LONG with 4h DIVERGED (4h still BEARISH while 1h flips BULLISH — bull trap risk)
-4. Volume ratio < 1.0 (no volume confirmation)
-5. R:R < 1.3 after fees
-6. Already {active_count} positions open AND this is a MODERATE signal
-7. RSI in extreme zone for direction (LONG RSI>70, SHORT RSI<25)
-8. {direction} against strong reversal (LONG with RSI>75 dropping, SHORT with RSI<25 rising)
+3. Volume ratio < 1.0 (no volume confirmation)
+4. R:R < 1.3 after fees
+5. Already {active_count} positions open AND signal is MODERATE
+6. RSI in extreme zone (LONG RSI>72, SHORT RSI<25)
+7. {direction} against strong reversal (LONG RSI>75 dropping, SHORT RSI<25 rising)
 
-CONFIRM if EMA cross 1h aligns, RSI has momentum, volume confirms.
-Note: SHORT does NOT need 4h alignment (4h EMA lags downturns); but 1h cross must be bearish.
+CLASSIFY mode (critical for SL/TP/timeout sizing):
+- "SWING": with-trend (LONG with 4h BULLISH, OR SHORT with 4h BEARISH). Hold long, wide SL/TP.
+- "SCALP": counter-trend (LONG with 4h BEARISH, OR SHORT with 4h BULLISH/UNKNOWN). Quick in/out, tight SL/TP, short timeout. Most SHORT in a bull market are SCALP.
+- "QUICK": neutral 4h, 1h cross strong, take 1-2 ATR move only.
+
+For chosen MODE, suggest multipliers and timeout (overrides defaults):
+| Mode  | sl_mult (xATR) | tp_mult (xATR) | timeout_h |
+|-------|---------------:|---------------:|----------:|
+| SWING |       1.5–2.0 |       2.5–3.5 |      8–12 |
+| SCALP |       0.8–1.2 |       1.0–1.8 |      2–4  |
+| QUICK |       1.0–1.5 |       1.5–2.5 |      4–6  |
+
+User policy: trades should resolve QUICKLY (< 12h). NEVER suggest timeout > 12h.
+Prefer SCALP for any counter-trend setup. Prefer SWING only when HTF clearly aligns.
 
 Reply ONLY in this JSON format, nothing else:
-{{"decision": "CONFIRM" or "REJECT", "reason": "one sentence", "confidence": 0-100}}"""
+{{"decision": "CONFIRM" or "REJECT", "mode": "SWING" or "SCALP" or "QUICK", "sl_mult": 1.5, "tp_mult": 2.5, "timeout_h": 6, "reason": "one sentence", "confidence": 0-100}}"""
 
+    if variant_body_template:
+        try:
+            prompt = variant_body_template.format(
+                coin=coin, direction=direction,
+                entry=entry, sl=sl, tp=tp, rr=rr,
+                rsi=rsi, rsi_prev=rsi_prev, rsi_delta=rsi - rsi_prev,
+                ema20=ema20, ema50=ema50, ema_cross_str=ema_cross_str,
+                ema_gap=ema_gap, ema_cross_4h_str=ema_cross_4h_str,
+                vol_ratio=vol_ratio, atr=atr, trend=trend, strength=strength,
+                active_count=active_count, mtf_note=mtf_note, few_shot=few_shot,
+            )
+        except Exception as _e:
+            print(f"  variant body render failed, using baseline: {_e}")
+
+    raw_response = ""
+    tokens_in = tokens_out = None
+    review: dict = {}
     try:
         body = json.dumps({
             "model": "deepseek-chat",
@@ -739,8 +1049,11 @@ Reply ONLY in this JSON format, nothing else:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
 
+        usage = result.get("usage", {}) if isinstance(result, dict) else {}
+        tokens_in = usage.get("prompt_tokens")
+        tokens_out = usage.get("completion_tokens")
         content = result["choices"][0]["message"]["content"].strip()
-        # Extract JSON from response (handle markdown code blocks)
+        raw_response = content
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -751,11 +1064,78 @@ Reply ONLY in this JSON format, nothing else:
         review["decision"] = review.get("decision", "CONFIRM").upper()
         if review["decision"] not in ("CONFIRM", "REJECT"):
             review["decision"] = "CONFIRM"
-        return review
-
     except Exception as e:
         print(f"  LLM review error: {e} — defaulting to CONFIRM")
-        return {"decision": "CONFIRM", "reason": f"API error: {e}", "confidence": 0}
+        review = {"decision": "CONFIRM", "reason": f"API error: {e}", "confidence": 0}
+        raw_response = raw_response or f"ERROR: {e}"
+
+    mode = str(review.get("mode", "")).upper()
+    if mode not in ("SWING", "SCALP", "QUICK"):
+        if direction == "LONG":
+            mode = "SWING" if ema_cross_4h_str == "BULLISH" else "SCALP"
+        else:
+            mode = "SWING" if ema_cross_4h_str == "BEARISH" else "SCALP"
+    review["mode"] = mode
+
+    mode_defaults = {
+        "SWING": {"sl_mult": 2.0, "tp_mult": 3.0, "timeout_h": 12},
+        "SCALP": {"sl_mult": 1.0, "tp_mult": 1.5, "timeout_h": 4},
+        "QUICK": {"sl_mult": 1.2, "tp_mult": 2.0, "timeout_h": 6},
+    }
+    d = mode_defaults[mode]
+    try:
+        sl_mult = float(review.get("sl_mult") or d["sl_mult"])
+    except Exception:
+        sl_mult = d["sl_mult"]
+    try:
+        tp_mult = float(review.get("tp_mult") or d["tp_mult"])
+    except Exception:
+        tp_mult = d["tp_mult"]
+    try:
+        timeout_h = float(review.get("timeout_h") or d["timeout_h"])
+    except Exception:
+        timeout_h = d["timeout_h"]
+
+    sl_mult = max(0.5, min(sl_mult, 2.5))
+    tp_mult = max(0.8, min(tp_mult, 4.0))
+    timeout_h = max(1.0, min(timeout_h, 12.0))
+
+    review["sl_mult"] = sl_mult
+    review["tp_mult"] = tp_mult
+    review["timeout_h"] = timeout_h
+
+    if decision_logger is not None:
+        try:
+            decision_id = decision_logger.log_decision(
+                source="signal_review",
+                coin=coin.lower(),
+                direction=direction,
+                model="deepseek-chat",
+                prompt=prompt,
+                response=raw_response,
+                decision=review.get("decision", "CONFIRM"),
+                reason=review.get("reason", ""),
+                confidence=review.get("confidence", 0),
+                indicators={
+                    "rsi": rsi, "rsi_prev": rsi_prev,
+                    "ema20": ema20, "ema50": ema50,
+                    "ema_gap_pct": ema_gap, "ema_cross_4h": ema_cross_4h_str,
+                    "vol_ratio": vol_ratio, "atr": atr,
+                    "trend": trend, "strength": strength,
+                    "entry": entry, "sl": sl, "tp": tp, "rr": rr,
+                },
+                market_state={"active_positions": active_count},
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                prompt_variant=variant_name,
+                prompt_version=variant_version,
+                rag_context=rag_context_for_log,
+            )
+            review["decision_id"] = decision_id
+        except Exception as e:
+            print(f"  [WARN] decision_logger.log_decision failed: {e}")
+
+    return review
 
 
 def fetch_prices() -> dict:
@@ -1087,6 +1467,9 @@ def run_once():
                 confidence = review.get("confidence", 0)
                 print(f"  LLM: {decision} ({confidence}%) — {reason}")
 
+                if review.get("decision_id"):
+                    best["decision_id"] = review["decision_id"]
+
                 if decision == "REJECT":
                     best["status"] = "llm_rejected"
                     best["llm_reason"] = reason
@@ -1103,6 +1486,41 @@ def run_once():
                     print(f"  REJECTED: {coin_u} {best['direction']} — {reason}")
                 else:
                     coin_key = best["coin"]
+                    mode = review.get("mode", "SWING")
+                    sl_mult = review.get("sl_mult", ATR_SL_MULT)
+                    tp_mult = review.get("tp_mult", ATR_TP_MULT)
+                    timeout_h = review.get("timeout_h", 12.0)
+
+                    atr_v = best.get("atr", 0)
+                    if atr_v > 0 and (sl_mult != ATR_SL_MULT or tp_mult != ATR_TP_MULT):
+                        if best["direction"] == "LONG":
+                            new_sl = best["entry"] - sl_mult * atr_v
+                            new_tp = best["entry"] + tp_mult * atr_v
+                        else:
+                            new_sl = best["entry"] + sl_mult * atr_v
+                            new_tp = best["entry"] - tp_mult * atr_v
+                        best["sl"] = round(new_sl, 8)
+                        best["tp"] = round(new_tp, 8)
+                        best["sl_pct"] = round(abs(new_sl - best["entry"]) / best["entry"] * 100, 3)
+                        best["tp_pct"] = round(abs(new_tp - best["entry"]) / best["entry"] * 100, 3)
+                        best["rr_ratio"] = round(tp_mult / sl_mult, 2)
+                        sized = calc_position_size(best["entry"], best["sl"], get_portfolio_balance())
+                        best["qty"] = sized["qty"]
+                        best["position_usd"] = sized["position_usd"]
+                        best["risk_usd"] = sized["risk_usd"]
+                        sl_pct = best["sl_pct"]
+                        tp_pct = best["tp_pct"]
+                        pos_usd = best["position_usd"]
+                        risk_usd = best["risk_usd"]
+                        qty = best["qty"]
+
+                    timeout_at = (datetime.now(timezone.utc) + timedelta(hours=timeout_h)).isoformat()
+                    best["mode"] = mode
+                    best["sl_mult"] = sl_mult
+                    best["tp_mult"] = tp_mult
+                    best["timeout_h"] = timeout_h
+                    best["timeout_at"] = timeout_at
+
                     states = trading_state.get("states", {})
                     if coin_key not in states:
                         states[coin_key] = {}
@@ -1116,6 +1534,11 @@ def run_once():
                         "order_id": "",
                         "signal_strength": strength,
                         "signal_time": best["timestamp"],
+                        "mode": mode,
+                        "sl_mult": sl_mult,
+                        "tp_mult": tp_mult,
+                        "timeout_h": timeout_h,
+                        "timeout_at": timeout_at,
                     })
                     trading_state["states"] = states
                     save_trading_state(trading_state)
@@ -1126,10 +1549,10 @@ def run_once():
                     save_pending_signal(best)
 
                     msg = (
-                        f"✅ *[AUTO SIGNAL] {coin_u} {best['direction']}* ({strength})\n"
+                        f"✅ *[AUTO SIGNAL] {coin_u} {best['direction']}* ({strength}) — *{mode}* / timeout {timeout_h:.0f}h\n"
                         f"Entry: *{fmt_price(best['entry'])}*\n"
-                        f"SL: {fmt_price(best['sl'])} (-{sl_pct:.1f}%, {ATR_SL_MULT}x ATR4h)\n"
-                        f"TP: {fmt_price(best['tp'])} (+{tp_pct:.1f}%, {ATR_TP_MULT}x ATR4h)\n"
+                        f"SL: {fmt_price(best['sl'])} (-{sl_pct:.1f}%, {sl_mult:.1f}x ATR4h)\n"
+                        f"TP: {fmt_price(best['tp'])} (+{tp_pct:.1f}%, {tp_mult:.1f}x ATR4h)\n"
                         f"R/R: {best['rr_ratio']}\n"
                         f"\n💰 *Position sizing* (${balance:,.0f} portfolio)\n"
                         f"Size: ${pos_usd:,.0f} ({qty:.4f} {coin_u})\n"
@@ -1317,6 +1740,11 @@ def daemon_loop():
     print(f"[daemon] Monitoring {len(SYMBOLS)} coins: {coins_str}...")
     print(f"[daemon] TA: RSI({RSI_PERIOD}), EMA({EMA_FAST_PERIOD}/{EMA_SLOW_PERIOD} cross), ATR({ATR_PERIOD})")
     print(f"[daemon] Signal: STRICT EMA cross only (no SIDEWAYS), SL={ATR_SL_MULT}xATR, TP={ATR_TP_MULT}xATR")
+    if COIN_ALLOWLIST:
+        print(f"[daemon] Coin allowlist ({len(COIN_ALLOWLIST)}): {sorted(COIN_ALLOWLIST)}")
+    else:
+        print(f"[daemon] Coin allowlist: DISABLED (all monitored coins eligible)")
+    print(f"[daemon] Volatility regime filter: ATR/price <= {VOL_REGIME_MAX_PCT:.1f}%")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:
