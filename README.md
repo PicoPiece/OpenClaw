@@ -164,6 +164,18 @@ docker compose pull && docker compose up -d
   0 2 * * * /home/picopiece/openclaw/backup.sh >> /home/picopiece/openclaw/backup.log 2>&1
   ```
 
+## Sibling monitors
+
+Cac he thong monitor khac chay tren cung host `picopiece-X99`, dung chung
+crontab nhung CO BOT/Channel/.env rieng (KHONG dung chung voi openclaw):
+
+| Repo | Bot Telegram | Cron | Muc dich |
+|---|---|---|---|
+| `~/projects/SolarSystemMonitoring/` | (rieng — `SOLAR_TELEGRAM_BOT_TOKEN`) | `*/10 * * * *` poll, `0 20 * * *` summary | Track 4 he inverter solar (LuxPower, Lumentree, Power Master/Powmr, Deye), alert offline/fault + bao cao ngay |
+
+Tham khao: [`~/projects/SolarSystemMonitoring/README.md`](../projects/SolarSystemMonitoring/README.md).
+Khong moutn vao container `openclaw`, khong dung chung `.env`.
+
 ## Luu y bao mat
 
 - **KHONG** expose port 18789 ra public internet
