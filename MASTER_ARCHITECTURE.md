@@ -219,9 +219,14 @@ Checks every 30 min using **live Binance wallet** (not stale state file):
 ### Brain 1: OpenClaw Bot (DeepSeek via Telegram)
 - **90% of daily interaction**
 - Always-on daemon (`telegram_bridge.py`)
-- Slash commands: `/status /wallet /asi /positions /signals /grids /pause /resume /tradectrl /briefing /help`
+- Slash commands: `/status /wallet /asi /positions /signals /grids /pause /resume /tradectrl /briefing /memory /forget /help`
 - Free-text chat → DeepSeek with real-time system context
-- Cost: ~$1-3/mo
+- **Persistent conversation memory** (`data/telegram_memory.json`):
+  - Last 12 turns kept verbatim
+  - Older turns auto-compressed into bullet-point summary via DeepSeek
+  - Session timeout: 30 min idle → marked as "resumed" (history kept, just flagged)
+  - Use `/memory` to inspect, `/forget` to wipe
+- Cost: ~$1-3/mo (memory adds ~$0.5/mo for summarization)
 
 ### Brain 2: Strategist (Claude via Cursor)
 - **5-10% interaction** — major decisions
@@ -358,6 +363,8 @@ openclaw/
     ├── decisions.db                        SQLite LLM decisions log
     ├── deepseek_cost_state.json            DeepSeek spend tracking
     ├── pending_signal.json                 Latest signal awaiting review
+    ├── telegram_bridge_state.json          Telegram update_id offset
+    ├── telegram_memory.json                Conversation memory (recent + summary)
     ├── workspace-finance/                  FinanceBot agent (OpenClaw cron)
     │   ├── CLAUDE.md                       FinanceBot instructions
     │   └── trading_control.json            Auto-trade enable + thresholds
@@ -437,7 +444,7 @@ openclaw/
 ## 10. Future enhancements (backlog)
 
 - [ ] Add `verify_futures_listed()` to backtest scripts
-- [ ] Memory layer for Telegram bridge (remember last 5 chats per session)
+- [x] Memory layer for Telegram bridge (recent turns + DeepSeek summary, May 2026)
 - [ ] Voice input via Telegram (Whisper → DeepSeek)
 - [ ] Pyramiding / DCA-in for winning Futures positions (after live data validates)
 - [ ] Auto-rotation of grid coins (monthly re-score top sideways winners)

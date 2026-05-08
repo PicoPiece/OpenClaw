@@ -32,11 +32,18 @@ sys.path.insert(0, str(ROOT))
 
 ENV_FILE = ROOT / ".env"
 STATE_FILE = DATA / "telegram_bridge_state.json"
+MEMORY_FILE = DATA / "telegram_memory.json"
 DEEPSEEK_API = "https://api.deepseek.com/v1/chat/completions"
 TG_API_BASE = "https://api.telegram.org/bot{token}"
 
 POLL_INTERVAL = 3.0
 LONG_POLL_TIMEOUT = 25
+
+# Memory config
+RECENT_TURNS_LIMIT = 10  # keep last N turns verbatim
+SUMMARIZE_TRIGGER = 12   # when recent_turns exceeds this, summarize oldest
+SUMMARIZE_BATCH = 6      # how many oldest turns to summarize at once
+SESSION_IDLE_MIN = 30    # minutes of idle → consider new session (informational)
 
 
 def load_env():
@@ -61,6 +68,86 @@ def save_state(state: dict):
 
 def load_state() -> dict:
     return safe_load(STATE_FILE) or {"last_update_id": 0}
+
+
+# =============================================================================
+# Memory layer — persistent multi-turn conversation
+# =============================================================================
+
+def load_memory() -> dict:
+    mem = safe_load(MEMORY_FILE) or {}
+    return {
+        "summary": mem.get("summary", ""),
+        "recent_turns": mem.get("recent_turns", []),
+        "last_active_ts": mem.get("last_active_ts"),
+        "total_turns": mem.get("total_turns", 0),
+    }
+
+
+def save_memory(mem: dict):
+    MEMORY_FILE.parent.mkdir(exist_ok=True)
+    MEMORY_FILE.write_text(json.dumps(mem, indent=2, ensure_ascii=False))
+
+
+def summarize_old_turns(turns: list, current_summary: str) -> str:
+    """Compress old turns into a bullet-point summary via DeepSeek."""
+    if not turns:
+        return current_summary
+    convo_text = "\n".join(
+        f"{'USER' if t['role']=='user' else 'BOT'}: {t['content'][:300]}"
+        for t in turns
+    )
+    sys_msg = ("Bạn là tóm tắt viên. Tóm tắt cuộc hội thoại sau thành "
+               "BULLET POINTS ngắn gọn (5-8 bullets), giữ lại facts/decisions/"
+               "context quan trọng cho follow-up. KHÔNG bịa thêm gì.")
+    user_msg = ""
+    if current_summary:
+        user_msg += f"BẢN TÓM TẮT TRƯỚC:\n{current_summary}\n\n"
+    user_msg += f"CUỘC HỘI THOẠI MỚI CẦN TÓM TẮT VÀ MERGE:\n{convo_text}\n\n"
+    user_msg += "Trả về bản tóm tắt MỚI hợp nhất (tối đa 800 từ)."
+    msgs = [{"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_msg}]
+    return deepseek_chat(msgs, max_tokens=600)
+
+
+def append_turn(role: str, content: str):
+    """Add turn to memory; auto-summarize if recent_turns gets too big."""
+    mem = load_memory()
+    mem["recent_turns"].append({
+        "role": role,
+        "content": content,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    mem["last_active_ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    mem["total_turns"] = mem.get("total_turns", 0) + 1
+    if len(mem["recent_turns"]) > SUMMARIZE_TRIGGER:
+        old = mem["recent_turns"][:SUMMARIZE_BATCH]
+        kept = mem["recent_turns"][SUMMARIZE_BATCH:]
+        new_summary = summarize_old_turns(old, mem["summary"])
+        mem["summary"] = new_summary
+        mem["recent_turns"] = kept
+        print(f"[memory] summarized {SUMMARIZE_BATCH} oldest turns, kept {len(kept)} recent")
+    save_memory(mem)
+
+
+def get_session_status() -> str:
+    mem = load_memory()
+    last_ts = mem.get("last_active_ts")
+    if not last_ts:
+        return "new"
+    try:
+        last = datetime.fromisoformat(last_ts.replace("Z","+00:00"))
+        idle_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
+        if idle_min > SESSION_IDLE_MIN:
+            return f"resumed_after_{int(idle_min)}min"
+        return "active"
+    except Exception:
+        return "unknown"
+
+
+def reset_memory():
+    mem = {"summary": "", "recent_turns": [], "last_active_ts": None, "total_turns": 0}
+    save_memory(mem)
 
 
 # =============================================================================
@@ -167,11 +254,15 @@ def cmd_help() -> str:
         "  /resume     — Resume auto-trade",
         "  /tradectrl  — Show trading control config",
         "",
+        b("Memory:"),
+        "  /memory     — Xem conversation memory (summary + recent)",
+        "  /forget     — Reset memory (start fresh chat)",
+        "",
         b("Other:"),
         "  /briefing   — Generate morning briefing now",
         "  /help       — This menu",
         "",
-        i("Hoặc chat free-text bằng tiếng Việt → mình sẽ trả lời với context từ system"),
+        i("Hoặc chat free-text bằng tiếng Việt → mình nhớ context conversation trước"),
     ]
     return "\n".join(lines)
 
@@ -387,19 +478,7 @@ def cmd_briefing() -> str:
         return f"❌ Briefing err: {e}\n{html_escape(traceback.format_exc()[:500])}"
 
 
-COMMANDS = {
-    "/help": cmd_help, "/start": cmd_help,
-    "/status": cmd_status,
-    "/wallet": cmd_wallet,
-    "/asi": cmd_asi,
-    "/positions": cmd_positions,
-    "/signals": cmd_signals,
-    "/grids": cmd_grids,
-    "/pause": cmd_pause,
-    "/resume": cmd_resume,
-    "/tradectrl": cmd_tradectrl,
-    "/briefing": cmd_briefing,
-}
+# NOTE: COMMANDS dict is defined below, after cmd_memory and cmd_forget.
 
 
 # =============================================================================
@@ -449,25 +528,110 @@ def build_ai_context() -> str:
 
 def free_text_response(user_msg: str) -> str:
     context = build_ai_context()
-    system = f"""Bạn là OpenClaw, AI trading co-pilot của user. Trả lời tiếng Việt, ngắn gọn.
+    mem = load_memory()
+    sess_status = get_session_status()
 
-CONTEXT HIỆN TẠI:
-{context}
+    system_parts = [
+        "Bạn là OpenClaw, AI trading co-pilot của user. Trả lời tiếng Việt, ngắn gọn.",
+        "",
+        "CONTEXT HIỆN TẠI (live data, refresh mỗi turn):",
+        context,
+        "",
+        "ARCHITECTURE:",
+        "- Multi-Layer Portfolio: HODL Core (Earn), Grid Yield (4 Spot Grid bots: AAVE/DOT/XRP/AVAX), Active Futures (OpenClaw 11-coin allowlist), Reserve (Spot USDT)",
+        "- Goal: ASI >= 2.0 (profit >= 2x LLM infra cost) để self-fund.",
+        "- Trade-off: Conservative > aggressive. Patient > impulsive.",
+        "",
+    ]
+    if mem.get("summary"):
+        system_parts.append("PREVIOUS CONVERSATION SUMMARY (older turns, compressed):")
+        system_parts.append(mem["summary"])
+        system_parts.append("")
+    if sess_status.startswith("resumed"):
+        system_parts.append(f"NOTE: User vừa quay lại sau idle ({sess_status}). Có thể greet ngắn nếu phù hợp.")
+        system_parts.append("")
+    system_parts += [
+        "GUIDELINES:",
+        "- Trả lời <300 từ.",
+        "- Dùng emoji vừa phải. KHÔNG markdown asterisks/underscores. KHÔNG HTML tags.",
+        "- Khi propose action, đưa concrete numbers và reasoning.",
+        "- Khi user hỏi confused, ask clarifying question.",
+        "- Có ngữ cảnh từ recent_turns + summary -> tham chiếu được tới chủ đề trước.",
+    ]
+    system = "\n".join(system_parts)
 
-ARCHITECTURE:
-- Multi-Layer Portfolio: HODL Core (Earn), Grid Yield (4 Spot Grid bots: AAVE/DOT/XRP/AVAX), Active Futures (OpenClaw 11-coin allowlist), Reserve (Spot USDT)
-- Goal: ASI ≥ 2.0 (profit ≥ 2× LLM infra cost) để self-fund.
-- Trade-off: Conservative > aggressive. Patient > impulsive.
+    msgs = [{"role": "system", "content": system}]
+    for t in mem.get("recent_turns", []):
+        msgs.append({"role": t["role"], "content": t["content"]})
+    msgs.append({"role": "user", "content": user_msg})
 
-GUIDELINES:
-- Trả lời <300 từ.
-- Dùng emoji vừa phải. KHÔNG markdown asterisks/underscores. KHÔNG HTML tags.
-- Khi propose action, đưa concrete numbers và reasoning.
-- Khi user hỏi gì confused, ask clarifying question."""
+    response = deepseek_chat(msgs, max_tokens=600)
 
-    msgs = [{"role": "system", "content": system},
-            {"role": "user", "content": user_msg}]
-    return deepseek_chat(msgs, max_tokens=600)
+    if not response.startswith("❌"):
+        append_turn("user", user_msg)
+        append_turn("assistant", response)
+    return response
+
+
+# =============================================================================
+# Memory management commands
+# =============================================================================
+
+def cmd_memory() -> str:
+    mem = load_memory()
+    sess = get_session_status()
+    summary = mem.get("summary") or "(empty)"
+    recent = mem.get("recent_turns", [])
+    lines = [
+        b("🧠 Conversation Memory"),
+        f"Session: {html_escape(sess)}",
+        f"Total turns: {mem.get('total_turns', 0)}",
+        f"Recent turns kept: {len(recent)}/{SUMMARIZE_TRIGGER}",
+        f"Summary length: {len(summary)} chars",
+        "",
+        b("Summary preview:"),
+        html_escape(summary[:500] + ("..." if len(summary) > 500 else "")),
+        "",
+        b("Last 3 turns:"),
+    ]
+    for t in recent[-3:]:
+        role = "👤" if t["role"] == "user" else "🤖"
+        lines.append(f"{role} {html_escape(t['content'][:120])}")
+    lines.append("")
+    lines.append(i("Use /forget to wipe memory."))
+    return "\n".join(lines)
+
+
+def cmd_forget() -> str:
+    mem = load_memory()
+    n = len(mem.get("recent_turns", []))
+    has_summary = bool(mem.get("summary"))
+    reset_memory()
+    return ("🧹 " + b("Memory wiped") +
+            f"\n\nCleared {n} recent turns" +
+            (" + summary" if has_summary else "") +
+            "\n\n" + i("Next chat starts fresh (system context vẫn có, history thì không)."))
+
+
+# =============================================================================
+# Commands registry (must be after all cmd_* defs)
+# =============================================================================
+
+COMMANDS = {
+    "/help": cmd_help, "/start": cmd_help,
+    "/status": cmd_status,
+    "/wallet": cmd_wallet,
+    "/asi": cmd_asi,
+    "/positions": cmd_positions,
+    "/signals": cmd_signals,
+    "/grids": cmd_grids,
+    "/pause": cmd_pause,
+    "/resume": cmd_resume,
+    "/tradectrl": cmd_tradectrl,
+    "/briefing": cmd_briefing,
+    "/memory": cmd_memory,
+    "/forget": cmd_forget,
+}
 
 
 # =============================================================================
