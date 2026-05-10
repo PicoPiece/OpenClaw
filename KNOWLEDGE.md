@@ -123,6 +123,16 @@ Position sizing (`binance_price_alert.py`):
 - MIN_VOLUME_USD = $10M (filters out illiquid coins)
 - VOL_REGIME_MAX_PCT = 2.5% (ATR/price cap)
 
+Breakout Off-Allowlist mode (added 2026-05-10):
+- Env BREAKOUT_OFFLIST=1 enables explosive burst signals on coins NOT in
+  the 11-coin allowlist (scans full top-20 by volume).
+- BREAKOUT_RISK_PCT = 1.5% (half of standard)
+- BREAKOUT_SL_ATR_MULT = 0.6 (vs 0.8 for allowlist breakouts)
+- BREAKOUT_TP_ATR_MULT = 2.0 (vs 2.5 for allowlist breakouts)
+- BREAKOUT_VOL_REGIME_MAX_PCT = 5.0% (vs 2.5%, since high vol IS the signal)
+- Standard EMA-cross signals are STILL allowlist-only (only explosive bursts)
+- LLM gets stricter review prompt with mode_hint=BREAKOUT_OFFLIST
+
 RSI thresholds:
 - RSI_OVERBOUGHT = 70, RSI_OVERSOLD = 30
 - RSI_LONG_MIN = 45 (need momentum for long)
@@ -200,6 +210,24 @@ Top lessons (chronological, key learnings from real failures):
    - Symptom: when asked about allowlist, shields, lessons → bot bịa
    - Cause: system prompt only had 4 lines; bot used pretraining knowledge
    - Fix: This KNOWLEDGE.md + dynamic retrieval into prompt.
+
+8. **Allowlist too strict, missed breakouts on alts (May 2026)**
+   - Symptom: User went manual on CHIP/ONDO/SAHARA breakouts (off-allowlist).
+     CHIP/ONDO winners +$13, but follow-up SLs lost $-21. Risk Guardian
+     auto-paused the system.
+   - Cause: COIN_ALLOWLIST + VOL_REGIME_MAX_PCT 2.5% blocked all alt breakouts.
+     CHIP was rank-5 by volume ($248M) but never considered.
+   - Fix: Added BREAKOUT_OFFLIST mode — explosive burst path now scans full
+     top-20 universe with tighter risk (1.5%) and stricter SL/TP. Standard
+     EMA-cross signals still allowlist-only.
+   - Lesson: USER manual chasing burns counter; system catching the same
+     signal applies risk discipline (smaller position, tighter SL, time exit).
+
+9. **Telegram bot conflict (May 2026)**
+   - Symptom: 2 bots (Docker openclaw + external telegram_bridge.service)
+     polled same token → 409 Conflict every 30s.
+   - Fix: Disabled external telegram_bridge.service. Docker openclaw owns
+     Telegram. (KNOWLEDGE.md and knowledge_loader.py remain for future use.)
 
 ---
 

@@ -143,6 +143,23 @@ def _suspended_coins() -> set[str]:
 # Default 2.5 (loose — most live signals pass; tighten to 2.0 for stricter).
 VOL_REGIME_MAX_PCT = float(os.environ.get("VOL_REGIME_MAX_PCT", "2.5"))
 
+# === EXPLOSIVE BREAKOUT OFF-ALLOWLIST mode (2026-05-10) ===
+# Allows the EXPLOSIVE burst path (Gap 4) to fire on coins NOT in COIN_ALLOWLIST,
+# scanning the full top-N volume universe. EMA-cross signals remain allowlist-only.
+# Rationale: high-volume alts (CHIP, SAHARA, ONDO etc.) often have clean breakouts
+# that the allowlist misses. We accept higher per-trade variance in exchange for
+# more opportunities, with strict mitigations:
+#   - Smaller risk (BREAKOUT_RISK_PCT, default 1.5% vs default 3%)
+#   - Tighter SL (BREAKOUT_SL_ATR_MULT, default 0.6 vs 0.8)
+#   - Smaller TP (BREAKOUT_TP_ATR_MULT, default 2.0 vs 2.5)
+#   - Vol regime cap relaxed but capped at BREAKOUT_VOL_REGIME_MAX_PCT (default 5%)
+#   - Signal tagged "BREAKOUT_OFFLIST" so LLM/executor can apply stricter review
+BREAKOUT_OFFLIST_ENABLED = os.environ.get("BREAKOUT_OFFLIST", "0").lower() in ("1", "true", "yes")
+BREAKOUT_RISK_PCT = float(os.environ.get("BREAKOUT_RISK_PCT", "1.5"))
+BREAKOUT_SL_ATR_MULT = float(os.environ.get("BREAKOUT_SL_ATR_MULT", "0.6"))
+BREAKOUT_TP_ATR_MULT = float(os.environ.get("BREAKOUT_TP_ATR_MULT", "2.0"))
+BREAKOUT_VOL_REGIME_MAX_PCT = float(os.environ.get("BREAKOUT_VOL_REGIME_MAX_PCT", "5.0"))
+
 
 # ---------------------------------------------------------------------------
 # Auto-discover top coins by volume
@@ -579,20 +596,26 @@ def calc_open_risk(trading_state: dict, prices: dict) -> tuple[float, list]:
     return total_risk, details
 
 
-def calc_position_size(entry: float, sl: float, balance: float) -> dict:
+def calc_position_size(entry: float, sl: float, balance: float,
+                        risk_pct_override: float | None = None) -> dict:
     """Calculate position size and risk for a new trade.
-    Returns dict with qty, position_usd, risk_usd, risk_pct."""
+    Returns dict with qty, position_usd, risk_usd, risk_pct.
+
+    risk_pct_override lets callers (e.g. breakout off-allowlist signals) use a
+    smaller risk allocation than the global RISK_PER_TRADE_PCT.
+    """
+    risk_pct = risk_pct_override if risk_pct_override is not None else RISK_PER_TRADE_PCT
     risk_per_unit = abs(entry - sl)
     if risk_per_unit == 0 or entry == 0:
         return {"qty": 0, "position_usd": 0, "risk_usd": 0, "risk_pct": 0}
-    max_risk_usd = balance * (RISK_PER_TRADE_PCT / 100)
+    max_risk_usd = balance * (risk_pct / 100)
     qty = max_risk_usd / risk_per_unit
     position_usd = qty * entry
     return {
         "qty": round(qty, 6),
         "position_usd": round(position_usd, 2),
         "risk_usd": round(max_risk_usd, 2),
-        "risk_pct": RISK_PER_TRADE_PCT,
+        "risk_pct": risk_pct,
     }
 
 
@@ -621,10 +644,14 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
             continue
 
         # FILTER 1: coin allowlist (backtest v6: +24.65R)
-        if COIN_ALLOWLIST and coin.lower() not in COIN_ALLOWLIST:
+        # Off-allowlist coins are NOT skipped if BREAKOUT_OFFLIST mode is on —
+        # they're allowed to fall through to the EXPLOSIVE path only (EMA-cross
+        # standard rules still gate on allowlist below).
+        in_allowlist = (not COIN_ALLOWLIST) or (coin.lower() in COIN_ALLOWLIST)
+        if not in_allowlist and not BREAKOUT_OFFLIST_ENABLED:
             continue
 
-        # FILTER 1b: Shield 1 — coin health auto-suspend
+        # FILTER 1b: Shield 1 — coin health auto-suspend (applies to ALL modes)
         if coin.lower() in _suspended_coins():
             continue
 
@@ -655,9 +682,12 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         if rsi_prev is None:
             continue
 
-        # FILTER 2: volatility regime — skip extreme high-vol bars
+        # FILTER 2: volatility regime — skip extreme high-vol bars.
+        # For off-allowlist breakout candidates, use the relaxed cap
+        # BREAKOUT_VOL_REGIME_MAX_PCT (default 5%) since high vol IS the signal.
         atr_pct = atr / price * 100
-        if atr_pct > VOL_REGIME_MAX_PCT:
+        vol_cap = BREAKOUT_VOL_REGIME_MAX_PCT if (not in_allowlist) else VOL_REGIME_MAX_PCT
+        if atr_pct > vol_cap:
             continue
 
         rsi_delta = rsi - rsi_prev
@@ -665,7 +695,9 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100 if ema_slow else 0
 
         # Gap 4: Explosive breakout entry path (parallel to standard EMA-cross detection)
-        # Triggers ngay khi 1h candle range > 1.5 ATR + volume > 3x avg + 4h aligned
+        # Triggers ngay khi 1h candle range > 1.5 ATR + volume > 3x avg + 4h aligned.
+        # Off-allowlist coins use TIGHTER params (smaller risk, tighter SL/TP)
+        # because they're unverified and can fade hard.
         if ind.get("explosive_burst"):
             burst_dir = ind.get("burst_direction")
             mtf_aligned = (
@@ -673,17 +705,31 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 (burst_dir == "SHORT" and ema_cross_4h in ("BEARISH", "UNKNOWN"))
             )
             if mtf_aligned:
+                # Pick params based on allowlist membership
+                if in_allowlist:
+                    sl_mult = 0.8
+                    tp_mult = 2.5
+                    risk_pct_override = None  # use global RISK_PER_TRADE_PCT
+                    mode_hint = "BREAKOUT"
+                else:
+                    sl_mult = BREAKOUT_SL_ATR_MULT
+                    tp_mult = BREAKOUT_TP_ATR_MULT
+                    risk_pct_override = BREAKOUT_RISK_PCT
+                    mode_hint = "BREAKOUT_OFFLIST"
+
                 entry_b = round(price, 6)
                 if burst_dir == "LONG":
-                    sl_b = round(entry_b - 0.8 * atr, 6)
-                    tp_b = round(entry_b + 2.5 * atr, 6)
+                    sl_b = round(entry_b - sl_mult * atr, 6)
+                    tp_b = round(entry_b + tp_mult * atr, 6)
                 else:
-                    sl_b = round(entry_b + 0.8 * atr, 6)
-                    tp_b = round(entry_b - 2.5 * atr, 6)
-                pos_b = calc_position_size(entry_b, sl_b, balance)
+                    sl_b = round(entry_b + sl_mult * atr, 6)
+                    tp_b = round(entry_b - tp_mult * atr, 6)
+                pos_b = calc_position_size(entry_b, sl_b, balance,
+                                            risk_pct_override=risk_pct_override)
                 signals.append({
                     "coin": coin, "symbol": symbol, "direction": burst_dir,
-                    "strength": "EXPLOSIVE", "mode_hint": "BREAKOUT",
+                    "strength": "EXPLOSIVE", "mode_hint": mode_hint,
+                    "in_allowlist": in_allowlist,
                     "entry": entry_b, "sl": sl_b, "tp": tp_b,
                     "sl_pct": round(abs(entry_b - sl_b) / entry_b * 100, 2),
                     "tp_pct": round(abs(tp_b - entry_b) / entry_b * 100, 2),
@@ -694,15 +740,20 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                     "ema_cross_4h": ema_cross_4h,
                     "vol_ratio": round(vol_ratio, 2),
                     "trend": trend,
-                    "rr_ratio": round(2.5 / 0.8, 2),
+                    "rr_ratio": round(tp_mult / sl_mult, 2),
                     "position_usd": pos_b["position_usd"], "qty": pos_b["qty"],
                     "risk_usd": pos_b["risk_usd"], "risk_pct": pos_b["risk_pct"],
                     "burst_range_atr": ind.get("last_bar_range_atr"),
                     "burst_vol_ratio": ind.get("last_bar_vol_ratio"),
+                    "atr_pct": round(atr_pct, 2),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status": "pending_review",
                 })
                 continue  # explosive entry takes priority — skip EMA-cross detection this cycle
+
+        # Standard EMA-cross signals: gate on allowlist (skip off-allowlist here)
+        if not in_allowlist:
+            continue
 
         # --- LONG rules (ALL must pass) ---
         # 1. EMA20 > EMA50 (bullish cross confirmed)
@@ -964,13 +1015,30 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
     breakout_block = ""
     if mode_hint == "BREAKOUT":
         breakout_block = (
-            f"\n⚡ EXPLOSIVE BREAKOUT DETECTED (last 1h candle): "
+            f"\n⚡ EXPLOSIVE BREAKOUT DETECTED (last 1h candle, ALLOWLIST coin): "
             f"range = {burst_range_atr}× ATR (>= 1.5 threshold), "
             f"volume = {burst_vol_ratio}× avg (>= 3.0 threshold)\n"
             f"Pre-set mode: BREAKOUT (tight SL 0.8×ATR, wide TP 2.5×ATR, R:R 3.1)\n"
             f"For BREAKOUT, IGNORE the SCALP/SWING/QUICK classification — return mode='BREAKOUT' "
             f"with sl_mult=0.8, tp_mult=2.5, timeout_h=4. Confirm only if news/momentum genuine, "
             f"reject if signs of fakeout (immediate price reversal, low follow-through volume).\n"
+        )
+    elif mode_hint == "BREAKOUT_OFFLIST":
+        atr_pct_v = signal.get("atr_pct", 0)
+        breakout_block = (
+            f"\n⚡⚠️  EXPLOSIVE BREAKOUT — OFF-ALLOWLIST COIN (HIGHER RISK)\n"
+            f"Last 1h candle: range = {burst_range_atr}× ATR (>= 1.5), "
+            f"volume = {burst_vol_ratio}× avg (>= 3.0)\n"
+            f"Volatility: ATR/price = {atr_pct_v}% (allowed up to {BREAKOUT_VOL_REGIME_MAX_PCT}% for breakouts)\n"
+            f"Pre-set mode: BREAKOUT_OFFLIST (TIGHT SL {BREAKOUT_SL_ATR_MULT}×ATR, "
+            f"TP {BREAKOUT_TP_ATR_MULT}×ATR, risk only {BREAKOUT_RISK_PCT}% of portfolio)\n"
+            f"This coin is NOT in the verified allowlist — apply STRICTER criteria:\n"
+            f"  • REJECT if vol_ratio < 1.5 on entry candle (not just 3x burst — needs follow-through)\n"
+            f"  • REJECT if RSI > 75 (LONG) or < 25 (SHORT) — likely exhausted breakout\n"
+            f"  • REJECT if 4h trend conflicts (UNKNOWN is OK, BEARISH for LONG = reject)\n"
+            f"  • CONFIRM only if there's a CLEAR catalyst pattern (vol burst + trend continuation)\n"
+            f"Return mode='BREAKOUT' with sl_mult={BREAKOUT_SL_ATR_MULT}, "
+            f"tp_mult={BREAKOUT_TP_ATR_MULT}, timeout_h=3 (faster exit for unknown coins).\n"
         )
 
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal, decide CONFIRM/REJECT, and classify the trade MODE.
@@ -1745,6 +1813,12 @@ def daemon_loop():
     else:
         print(f"[daemon] Coin allowlist: DISABLED (all monitored coins eligible)")
     print(f"[daemon] Volatility regime filter: ATR/price <= {VOL_REGIME_MAX_PCT:.1f}%")
+    if BREAKOUT_OFFLIST_ENABLED:
+        print(f"[daemon] BREAKOUT OFF-ALLOWLIST: ON | risk={BREAKOUT_RISK_PCT}% "
+              f"| SL={BREAKOUT_SL_ATR_MULT}xATR | TP={BREAKOUT_TP_ATR_MULT}xATR "
+              f"| vol_cap={BREAKOUT_VOL_REGIME_MAX_PCT}%")
+    else:
+        print(f"[daemon] BREAKOUT OFF-ALLOWLIST: OFF (set BREAKOUT_OFFLIST=1 to enable)")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:
