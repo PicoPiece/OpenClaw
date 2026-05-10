@@ -243,6 +243,218 @@ def classify_coin_for_breakout(coin: str, in_allowlist: bool) -> dict:
     }
 
 
+# === Pullback watch state ===
+
+def _load_pullback_watch() -> dict:
+    if not PULLBACK_WATCH_FILE.exists():
+        return {}
+    try:
+        return json.loads(PULLBACK_WATCH_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_pullback_watch(state: dict):
+    try:
+        PULLBACK_WATCH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PULLBACK_WATCH_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        print(f"[pullback] save error: {e}")
+
+
+def _purge_expired_watch(state: dict) -> dict:
+    """Remove entries past their watch window."""
+    now = datetime.now(timezone.utc)
+    keep = {}
+    for sym, entry in state.items():
+        try:
+            exp = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+            if now < exp and not entry.get("fired"):
+                keep[sym] = entry
+        except Exception:
+            pass
+    return keep
+
+
+def register_pullback_watch(signal: dict, llm_reason: str):
+    """Add a rejected breakout signal to the pullback watch list.
+
+    Only registers if the rejection reason mentions RSI extreme/exhaustion AND
+    the original signal had explosive_burst (we want pullback re-entries on
+    real momentum events, not generic rejects).
+    """
+    if not PULLBACK_REENTRY_ENABLED:
+        return
+    if signal.get("strength") != "EXPLOSIVE":
+        return
+    reason_lower = (llm_reason or "").lower()
+    rsi_keywords = ("rsi", "extreme", "exhaustion", "overbought", "oversold")
+    if not any(k in reason_lower for k in rsi_keywords):
+        return
+
+    state = _load_pullback_watch()
+    state = _purge_expired_watch(state)
+    sym = signal["symbol"]
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=PULLBACK_WATCH_WINDOW_MIN)).isoformat(timespec="seconds")
+    entry = {
+        "coin": signal["coin"],
+        "symbol": sym,
+        "direction": signal["direction"],
+        "rejected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rejected_entry": signal["entry"],
+        "rejected_rsi": signal.get("rsi", 0),
+        "rejected_atr": signal.get("atr", 0),
+        "rejected_burst_range_atr": signal.get("burst_range_atr"),
+        "rejected_burst_vol_ratio": signal.get("burst_vol_ratio"),
+        "ema_cross_4h": signal.get("ema_cross_4h"),
+        "tier": signal.get("tier"),
+        "in_allowlist": signal.get("in_allowlist", False),
+        "expires_at": expires,
+        "llm_reason": llm_reason,
+        "fired": False,
+        "checks": 0,
+    }
+    state[sym] = entry
+    _save_pullback_watch(state)
+    print(f"[pullback] watching {sym} until {expires} (rsi {entry['rejected_rsi']}, entry ${entry['rejected_entry']})")
+
+
+def check_pullback_entries(prices: dict, indicators: dict, balance: float) -> list:
+    """Scan pullback watch list and generate PULLBACK_REENTRY signals if conditions met.
+
+    Conditions for fire:
+      - Price has dropped >= PULLBACK_MIN_DROP_ATR from rejected entry (in ATR units)
+      - Current RSI cooled by >= PULLBACK_MIN_RSI_DELTA from rejected RSI
+      - Vol ratio normalized (<= PULLBACK_MAX_VOL_RATIO — FOMO cooled)
+      - 4h trend still aligned with original direction
+      - Coin not currently in active position (handled by caller via state check)
+    """
+    if not PULLBACK_REENTRY_ENABLED:
+        return []
+    state = _load_pullback_watch()
+    state = _purge_expired_watch(state)
+    fired_signals = []
+
+    for sym, entry in list(state.items()):
+        if entry.get("fired"):
+            continue
+        if sym not in prices or sym not in indicators:
+            continue
+
+        ind = indicators[sym]
+        price = prices[sym]
+        rsi_now = ind.get("rsi")
+        atr_now = ind.get("atr") or entry["rejected_atr"]
+        vol_ratio = ind.get("vol_ratio", 0)
+        ema_cross_4h = ind.get("ema_cross_4h", "UNKNOWN")
+        if rsi_now is None or atr_now is None or atr_now == 0:
+            continue
+
+        direction = entry["direction"]
+        rejected_entry = entry["rejected_entry"]
+        rejected_rsi = entry["rejected_rsi"]
+
+        # Drop check (LONG: price dropped from rejected_entry; SHORT: rallied up)
+        if direction == "LONG":
+            drop_atr = (rejected_entry - price) / atr_now
+        else:
+            drop_atr = (price - rejected_entry) / atr_now
+        rsi_delta = rejected_rsi - rsi_now if direction == "LONG" else rsi_now - rejected_rsi
+
+        # 4h trend still aligned?
+        if direction == "LONG":
+            mtf_aligned = ema_cross_4h in ("BULLISH", "UNKNOWN")
+        else:
+            mtf_aligned = ema_cross_4h in ("BEARISH", "UNKNOWN")
+
+        entry["checks"] = entry.get("checks", 0) + 1
+        # Conditions
+        cond_drop = drop_atr >= PULLBACK_MIN_DROP_ATR
+        cond_rsi = rsi_delta >= PULLBACK_MIN_RSI_DELTA
+        cond_vol = vol_ratio <= PULLBACK_MAX_VOL_RATIO
+        cond_mtf = mtf_aligned
+
+        if not (cond_drop and cond_rsi and cond_vol and cond_mtf):
+            entry["last_check"] = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "price": round(price, 8), "rsi_now": round(rsi_now, 1),
+                "drop_atr": round(drop_atr, 2), "rsi_delta": round(rsi_delta, 1),
+                "vol_ratio": round(vol_ratio, 2), "mtf_aligned": mtf_aligned,
+                "passed": False,
+            }
+            state[sym] = entry
+            continue
+
+        # FIRE pullback re-entry signal
+        sl_mult = PULLBACK_SL_ATR_MULT
+        tp_mult = PULLBACK_TP_ATR_MULT
+        entry_p = round(price, 8)
+        if direction == "LONG":
+            sl_p = round(entry_p - sl_mult * atr_now, 8)
+            tp_p = round(entry_p + tp_mult * atr_now, 8)
+        else:
+            sl_p = round(entry_p + sl_mult * atr_now, 8)
+            tp_p = round(entry_p - tp_mult * atr_now, 8)
+
+        # Use same risk tier as original (probe / off-list / allowlist)
+        in_allowlist = entry.get("in_allowlist", False)
+        tier_info = classify_coin_for_breakout(entry["coin"], in_allowlist)
+        risk_pct_override = tier_info["risk_pct"]
+        pos = calc_position_size(entry_p, sl_p, balance, risk_pct_override=risk_pct_override)
+
+        atr_pct = atr_now / price * 100 if price else 0
+        ema_gap_pct = abs(ind.get("ema20", 0) - ind.get("ema50", 0)) / ind.get("ema50", 1) * 100 if ind.get("ema50") else 0
+        signal = {
+            "coin": entry["coin"], "symbol": sym, "direction": direction,
+            "strength": "PULLBACK", "mode_hint": "PULLBACK_REENTRY",
+            "tier": tier_info["tier"],
+            "tier_reason": tier_info["reason"],
+            "in_allowlist": in_allowlist,
+            "entry": entry_p, "sl": sl_p, "tp": tp_p,
+            "sl_pct": round(abs(entry_p - sl_p) / entry_p * 100, 3),
+            "tp_pct": round(abs(tp_p - entry_p) / entry_p * 100, 3),
+            "atr": round(atr_now, 8), "rsi": round(rsi_now, 1),
+            "rsi_prev": round(ind.get("rsi_prev", rsi_now), 1),
+            "rsi_delta": round(rsi_now - ind.get("rsi_prev", rsi_now), 1),
+            "ema20": round(ind.get("ema20", 0), 8),
+            "ema50": round(ind.get("ema50", 0), 8),
+            "ema_gap_pct": round(ema_gap_pct, 3),
+            "ema_cross_4h": ema_cross_4h,
+            "vol_ratio": round(vol_ratio, 2),
+            "trend": ind.get("trend", "UNKNOWN"),
+            "rr_ratio": round(tp_mult / sl_mult, 2),
+            "position_usd": pos["position_usd"], "qty": pos["qty"],
+            "risk_usd": pos["risk_usd"], "risk_pct": pos["risk_pct"],
+            "atr_pct": round(atr_pct, 2),
+            # Pullback-specific context for LLM
+            "pullback_from_entry": entry["rejected_entry"],
+            "pullback_from_rsi": entry["rejected_rsi"],
+            "pullback_drop_atr": round(drop_atr, 2),
+            "pullback_rsi_delta": round(rsi_delta, 1),
+            "pullback_minutes_since_reject": round((
+                datetime.now(timezone.utc) -
+                datetime.fromisoformat(entry["rejected_at"].replace("Z", "+00:00"))
+            ).total_seconds() / 60, 1),
+            "burst_range_atr": entry.get("rejected_burst_range_atr"),
+            "burst_vol_ratio": entry.get("rejected_burst_vol_ratio"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "pending_review",
+        }
+        fired_signals.append(signal)
+        entry["fired"] = True
+        entry["fired_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry["fired_signal_summary"] = {
+            "entry": entry_p, "sl": sl_p, "tp": tp_p,
+            "drop_atr": round(drop_atr, 2), "rsi_now": round(rsi_now, 1),
+        }
+        state[sym] = entry
+        print(f"[pullback] FIRE {sym} {direction} @ ${entry_p} "
+              f"(drop {drop_atr:.2f} ATR, RSI {rejected_rsi:.0f}->{rsi_now:.0f})")
+
+    _save_pullback_watch(state)
+    return fired_signals
+
+
 # Volatility regime filter: skip signal if ATR/price > VOL_REGIME_MAX_PCT.
 # Default 2.5 (loose — most live signals pass; tighten to 2.0 for stricter).
 VOL_REGIME_MAX_PCT = float(os.environ.get("VOL_REGIME_MAX_PCT", "2.5"))
@@ -273,6 +485,21 @@ PROBE_RISK_PCT = float(os.environ.get("PROBE_RISK_PCT", "1.0"))
 PROBE_GRADUATION_TRADES = int(os.environ.get("PROBE_GRADUATION_TRADES", "4"))
 PROBE_DAILY_CAP_PER_COIN = int(os.environ.get("PROBE_DAILY_CAP_PER_COIN", "1"))
 DECISIONS_DB = SCRIPT_DIR / "data" / "decisions.db"
+
+# === PULLBACK RE-ENTRY mode (2026-05-10) ===
+# When an explosive breakout signal is REJECTED due to RSI extreme, the coin
+# is added to a "pullback watch" list. If price subsequently drops back from
+# the rejected high AND RSI cools down, a new PULLBACK_REENTRY signal fires.
+# This captures the textbook "wait for pullback, enter on dip" pattern that
+# the standard EMA-cross / explosive-burst rules miss.
+PULLBACK_REENTRY_ENABLED = os.environ.get("PULLBACK_REENTRY", "0").lower() in ("1", "true", "yes")
+PULLBACK_WATCH_FILE = SCRIPT_DIR / "data" / "pullback_watch.json"
+PULLBACK_WATCH_WINDOW_MIN = int(os.environ.get("PULLBACK_WATCH_WINDOW_MIN", "90"))
+PULLBACK_MIN_DROP_ATR = float(os.environ.get("PULLBACK_MIN_DROP_ATR", "1.0"))      # min drop from rejected high (ATR units)
+PULLBACK_MIN_RSI_DELTA = float(os.environ.get("PULLBACK_MIN_RSI_DELTA", "8.0"))    # RSI must cool by N points
+PULLBACK_SL_ATR_MULT = float(os.environ.get("PULLBACK_SL_ATR_MULT", "0.5"))         # tight invalidation
+PULLBACK_TP_ATR_MULT = float(os.environ.get("PULLBACK_TP_ATR_MULT", "2.5"))         # target = original burst high
+PULLBACK_MAX_VOL_RATIO = float(os.environ.get("PULLBACK_MAX_VOL_RATIO", "2.0"))     # FOMO cooled (vol back to normal-ish)
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +980,21 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
     if risk_budget < per_trade_risk * 0.5:
         return signals
 
+    # === PULLBACK RE-ENTRY check (highest priority) ===
+    # Scan watch list for coins where price has pulled back from rejected breakout.
+    # If conditions met, fire PULLBACK_REENTRY signal — bypasses standard checks.
+    try:
+        pullback_signals = check_pullback_entries(prices, indicators, balance)
+        for ps in pullback_signals:
+            sym = ps["symbol"]
+            existing_state = states.get(ps["coin"], {}).get("state", "IDLE")
+            if existing_state == "ACTIVE":
+                continue  # already in position, skip duplicate
+            ps["__priority"] = 0  # highest
+            signals.append(ps)
+    except Exception as e:
+        print(f"[pullback] check error: {e}")
+
     for coin, symbol in SYMBOL_MAP.items():
         if symbol not in prices or symbol not in indicators:
             continue
@@ -1179,6 +1421,36 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
             f"  • 4h trend strongly conflicts (BEARISH for LONG with strength)\n"
             f"Return mode='BREAKOUT' with sl_mult={BREAKOUT_SL_ATR_MULT}, "
             f"tp_mult={BREAKOUT_TP_ATR_MULT}, timeout_h=3.\n"
+        )
+    elif mode_hint == "PULLBACK_REENTRY":
+        pb_from_entry = signal.get("pullback_from_entry", entry)
+        pb_from_rsi = signal.get("pullback_from_rsi", 0)
+        pb_drop_atr = signal.get("pullback_drop_atr", 0)
+        pb_rsi_delta = signal.get("pullback_rsi_delta", 0)
+        pb_minutes = signal.get("pullback_minutes_since_reject", 0)
+        breakout_block = (
+            f"\n🔁 PULLBACK RE-ENTRY — explosive breakout cooled, retesting support\n"
+            f"Earlier (~{pb_minutes:.0f} min ago) we REJECTED a breakout at ${pb_from_entry} "
+            f"because RSI was extreme ({pb_from_rsi:.0f}).\n"
+            f"Since then: price pulled back {pb_drop_atr:.2f}× ATR, "
+            f"RSI cooled by {pb_rsi_delta:.0f} pts (now {rsi:.0f}), "
+            f"vol_ratio normalised to {vol_ratio:.2f}x.\n"
+            f"Original burst: range = {burst_range_atr}× ATR, volume = {burst_vol_ratio}× avg\n"
+            f"Pre-set: TIGHT SL {PULLBACK_SL_ATR_MULT}×ATR (invalidation: pullback low broken), "
+            f"TP {PULLBACK_TP_ATR_MULT}×ATR (target = original burst high or beyond)\n"
+            f"This is a textbook 'wait for pullback to support, then enter' setup.\n"
+            f"CONFIRM if:\n"
+            f"  • RSI cooled into healthy zone (40-65 LONG / 35-60 SHORT) — IDEAL\n"
+            f"  • Vol normalised (<2x) — FOMO faded, base building\n"
+            f"  • 4h trend still aligned with original direction\n"
+            f"  • Price near EMA20/EMA50 OR previous breakout level (now support)\n"
+            f"REJECT only if:\n"
+            f"  • Pullback was actually full reversal (price below pre-burst range)\n"
+            f"  • 4h trend flipped against direction\n"
+            f"  • RSI still >70 (LONG) or <30 (SHORT) — not really cooled\n"
+            f"  • Vol still elevated (>2x) — distribution / continued selling\n"
+            f"Return mode='BREAKOUT' with sl_mult={PULLBACK_SL_ATR_MULT}, "
+            f"tp_mult={PULLBACK_TP_ATR_MULT}, timeout_h=4.\n"
         )
 
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal, decide CONFIRM/REJECT, and classify the trade MODE.
@@ -1684,6 +1956,13 @@ def run_once():
                     best["llm_confidence"] = confidence
                     save_pending_signal(best)
 
+                    # Pullback re-entry watch: if rejected for RSI extreme on an
+                    # EXPLOSIVE breakout, queue for pullback monitoring (next 90 min)
+                    try:
+                        register_pullback_watch(best, reason)
+                    except Exception as e:
+                        print(f"[pullback] register error: {e}")
+
                     msg = (
                         f"🚫 *[REJECTED] {coin_u} {best['direction']}* ({strength})\n"
                         f"Entry: {fmt_price(best['entry'])} | SL: {fmt_price(best['sl'])} | TP: {fmt_price(best['tp'])}\n"
@@ -1964,6 +2243,12 @@ def daemon_loop():
               f"| graduation>={PROBE_GRADUATION_TRADES}t | cap={PROBE_DAILY_CAP_PER_COIN}/day per coin")
     else:
         print(f"[daemon] PROBE TRADES: OFF (set PROBE_TRADE=1 to enable)")
+    if PULLBACK_REENTRY_ENABLED:
+        print(f"[daemon] PULLBACK RE-ENTRY: ON | window={PULLBACK_WATCH_WINDOW_MIN}min "
+              f"| min_drop={PULLBACK_MIN_DROP_ATR}xATR | min_rsi_delta={PULLBACK_MIN_RSI_DELTA}pts "
+              f"| SL={PULLBACK_SL_ATR_MULT}xATR | TP={PULLBACK_TP_ATR_MULT}xATR")
+    else:
+        print(f"[daemon] PULLBACK RE-ENTRY: OFF (set PULLBACK_REENTRY=1 to enable)")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:

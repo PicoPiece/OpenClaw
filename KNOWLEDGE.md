@@ -146,6 +146,26 @@ Probe Trade mode (added 2026-05-10):
 - LLM prompt for PROBE: bias toward CONFIRM (data acquisition is worth $2-3),
   reject only on extreme RSI / fading vol / strong 4h conflict.
 
+Pullback Re-Entry mode (added 2026-05-10):
+- Env PULLBACK_REENTRY=1 enables a second-chance entry path.
+- Trigger: when an EXPLOSIVE breakout signal is REJECTED by LLM with reason
+  containing RSI keywords (extreme/exhaustion/overbought/oversold), the coin
+  is added to data/pullback_watch.json with 90-min expiry.
+- Fire conditions (all must pass on a later cycle):
+  - Price has dropped >= PULLBACK_MIN_DROP_ATR (1.0× ATR) from rejected entry
+  - RSI has cooled by >= PULLBACK_MIN_RSI_DELTA (8 pts)
+  - Vol ratio normalised <= PULLBACK_MAX_VOL_RATIO (2.0x — FOMO faded)
+  - 4h EMA trend still aligned with original direction
+- Risk on fire: tight SL = PULLBACK_SL_ATR_MULT (0.5× ATR), TP = 2.5× ATR,
+  R:R = 5.0. Risk uses tier classification (probe 1% if untested).
+- LLM gets PULLBACK_REENTRY-specific prompt explaining the original reject
+  and the cooled-down setup; biased to CONFIRM if RSI back to healthy zone.
+- Real-world motivation (2026-05-10): user manually re-entered TAO LONG at
+  $324 after the system rejected the breakout at $329 for RSI 78. Price had
+  pulled back from $329 high, RSI cooled, then ran to $338. This mode
+  systematizes that pattern.
+- Each coin can only fire once per watch cycle (fired flag prevents dup).
+
 RSI thresholds:
 - RSI_OVERBOUGHT = 70, RSI_OVERSOLD = 30
 - RSI_LONG_MIN = 45 (need momentum for long)
@@ -290,6 +310,7 @@ Key state files (all in `data/` unless noted):
 - `decisions.db` — SQLite of all LLM decisions (signal review)
 - `deepseek_cost_state.json` — DeepSeek API spend tracking
 - `pending_signal.json` — latest signal awaiting LLM review
+- `pullback_watch.json` — coins flagged for pullback re-entry monitoring
 - `telegram_memory.json` — bot conversation memory (this file's purpose)
 - `workspace-finance/trading_control.json` — auto-trade enable + thresholds
 - `workspace-finance/CLAUDE.md` — FinanceBot agent instructions
@@ -328,6 +349,17 @@ A: Default 20x. Higher leverage doesn't improve EV, only amplifies variance.
 
 Q: "Grid bot ROI thực tế?"
 A: 1.5-4%/mo realistic. Initial 25%/mo claim was wrong. See LESSONS #2.
+
+Q: "Hệ thống có biết vào lệnh sau khi giá hồi (pullback)?"
+A: Có — Pullback Re-Entry mode. Khi LLM REJECT một explosive breakout vì RSI
+   quá cao, coin được watch 90 phút. Nếu giá rớt >=1 ATR + RSI cool >=8 pts +
+   vol về <2x + 4h trend còn nguyên → fire PULLBACK_REENTRY signal với SL siêu
+   chặt 0.5×ATR và TP 2.5×ATR (R:R 5.0). Inspired by user's TAO trade 2026-05-10.
+
+Q: "Tại sao breakout bị reject mà giá vẫn lên?"
+A: Reject thường vì RSI extreme (>72 LONG) — đó là cảnh báo "đỉnh ngắn hạn".
+   Hệ thống không đoán sai trend mà chỉ ngại entry tệ. Pullback Re-Entry mode
+   sẽ catch lại nếu giá hồi về vùng support — đây là pattern textbook.
 
 ---
 
