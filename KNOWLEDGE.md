@@ -133,6 +133,19 @@ Breakout Off-Allowlist mode (added 2026-05-10):
 - Standard EMA-cross signals are STILL allowlist-only (only explosive bursts)
 - LLM gets stricter review prompt with mode_hint=BREAKOUT_OFFLIST
 
+Probe Trade mode (added 2026-05-10):
+- Env PROBE_TRADE=1 enables tiny "probe" trades on untested/thin-history coins.
+- Goal: build trade outcome dataset for RAG memory + decision learning.
+- Tier classification (auto, from decisions.db trades count per coin):
+  - OFFLIST_UNTESTED (0 trades): probe risk 1.0%, mode_hint=BREAKOUT_PROBE
+  - OFFLIST_THIN (1-3 trades): probe risk 1.0%, mode_hint=BREAKOUT_PROBE
+  - OFFLIST_ESTABLISHED (>=4 trades): risk 1.5%, mode_hint=BREAKOUT_OFFLIST
+  - ALLOWLIST: risk 3.0%, mode_hint=BREAKOUT
+- PROBE_GRADUATION_TRADES = 4 (after 4 closed trades, coin auto-graduates)
+- PROBE_DAILY_CAP_PER_COIN = 1 (max 1 probe per coin per 24h, anti-spam in chop)
+- LLM prompt for PROBE: bias toward CONFIRM (data acquisition is worth $2-3),
+  reject only on extreme RSI / fading vol / strong 4h conflict.
+
 RSI thresholds:
 - RSI_OVERBOUGHT = 70, RSI_OVERSOLD = 30
 - RSI_LONG_MIN = 45 (need momentum for long)
@@ -228,6 +241,16 @@ Top lessons (chronological, key learnings from real failures):
      polled same token → 409 Conflict every 30s.
    - Fix: Disabled external telegram_bridge.service. Docker openclaw owns
      Telegram. (KNOWLEDGE.md and knowledge_loader.py remain for future use.)
+
+10. **Cold-start dataset problem (May 2026)**
+    - Symptom: RAG memory + decision_logger had rich data only for 11 allowlist
+      coins. New coins (CHIP, SAHARA, ONDO, etc.) had 0-3 trades each, so LLM
+      review couldn't draw on similar past trades.
+    - Fix: Added PROBE_TRADE mode — small 1.0% risk trades on
+      untested/thin-history coins to build dataset. Auto-graduates to standard
+      breakout off-list (1.5%) after 4 closed trades.
+    - Trade-off: Accept ~$2-3 expected loss per probe in exchange for data
+      that improves future signal quality on these coins.
 
 ---
 

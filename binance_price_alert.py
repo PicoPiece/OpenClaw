@@ -139,6 +139,110 @@ def _suspended_coins() -> set[str]:
     _suspensions_cache["set"] = suspended
     _suspensions_cache["loaded_at"] = now
     return suspended
+
+
+# === Coin trade-history tier (probe trades) ===
+# Cache trade counts per coin to avoid hammering DB. Refreshed every 5 min.
+_coin_history_cache: dict = {"counts": {}, "loaded_at": 0.0}
+
+
+def _coin_trade_count(coin: str) -> int:
+    """Return number of CLOSED trades for a coin in decisions.db (cached 5min)."""
+    import time as _t
+    import sqlite3 as _sql
+    now = _t.time()
+    if now - _coin_history_cache["loaded_at"] > 300:
+        counts: dict[str, int] = {}
+        try:
+            if DECISIONS_DB.exists():
+                conn = _sql.connect(DECISIONS_DB)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT LOWER(coin), COUNT(*) FROM trades "
+                    "WHERE closed_at IS NOT NULL AND (is_shadow IS NULL OR is_shadow=0) "
+                    "GROUP BY LOWER(coin)"
+                )
+                counts = {r[0]: r[1] for r in cur.fetchall() if r[0]}
+                conn.close()
+        except Exception as e:
+            print(f"[probe] _coin_trade_count error: {e}")
+        _coin_history_cache["counts"] = counts
+        _coin_history_cache["loaded_at"] = now
+    return _coin_history_cache["counts"].get(coin.lower(), 0)
+
+
+def _probes_today_for_coin(coin: str) -> int:
+    """Count trades opened in the last 24h for this coin (anti-spam cap for probes).
+    Conservative: counts ALL trades, not just probes — for untested coins this is
+    essentially equivalent and avoids needing executor to tag mode='PROBE' in DB.
+    """
+    import sqlite3 as _sql
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    try:
+        if not DECISIONS_DB.exists():
+            return 0
+        conn = _sql.connect(DECISIONS_DB)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM trades WHERE LOWER(coin)=? AND opened_at >= ?",
+            (coin.lower(), cutoff))
+        n = cur.fetchone()[0]
+        conn.close()
+        return int(n)
+    except Exception:
+        return 0
+
+
+def classify_coin_for_breakout(coin: str, in_allowlist: bool) -> dict:
+    """Return classification + trading params for a breakout signal on this coin.
+
+    Returns dict with:
+      tier: 'ALLOWLIST' | 'OFFLIST_ESTABLISHED' | 'OFFLIST_THIN' | 'OFFLIST_UNTESTED'
+      mode_hint: signal mode label
+      risk_pct: risk per trade
+      sl_mult, tp_mult: ATR multipliers
+      reason: human-readable
+    """
+    if in_allowlist:
+        return {
+            "tier": "ALLOWLIST",
+            "mode_hint": "BREAKOUT",
+            "risk_pct": None,  # use global RISK_PER_TRADE_PCT
+            "sl_mult": 0.8,
+            "tp_mult": 2.5,
+            "reason": "in 11-coin verified allowlist",
+        }
+
+    n_trades = _coin_trade_count(coin)
+    if n_trades == 0:
+        return {
+            "tier": "OFFLIST_UNTESTED",
+            "mode_hint": "BREAKOUT_PROBE",
+            "risk_pct": PROBE_RISK_PCT,
+            "sl_mult": BREAKOUT_SL_ATR_MULT,
+            "tp_mult": BREAKOUT_TP_ATR_MULT,
+            "reason": "no trade history — probe to seed dataset",
+        }
+    if n_trades < PROBE_GRADUATION_TRADES:
+        return {
+            "tier": "OFFLIST_THIN",
+            "mode_hint": "BREAKOUT_PROBE",
+            "risk_pct": PROBE_RISK_PCT,
+            "sl_mult": BREAKOUT_SL_ATR_MULT,
+            "tp_mult": BREAKOUT_TP_ATR_MULT,
+            "reason": f"thin history ({n_trades}/{PROBE_GRADUATION_TRADES}) — probe",
+        }
+    # Established off-allowlist
+    return {
+        "tier": "OFFLIST_ESTABLISHED",
+        "mode_hint": "BREAKOUT_OFFLIST",
+        "risk_pct": BREAKOUT_RISK_PCT,
+        "sl_mult": BREAKOUT_SL_ATR_MULT,
+        "tp_mult": BREAKOUT_TP_ATR_MULT,
+        "reason": f"off-allowlist with {n_trades} trades — graduated",
+    }
+
+
 # Volatility regime filter: skip signal if ATR/price > VOL_REGIME_MAX_PCT.
 # Default 2.5 (loose — most live signals pass; tighten to 2.0 for stricter).
 VOL_REGIME_MAX_PCT = float(os.environ.get("VOL_REGIME_MAX_PCT", "2.5"))
@@ -159,6 +263,16 @@ BREAKOUT_RISK_PCT = float(os.environ.get("BREAKOUT_RISK_PCT", "1.5"))
 BREAKOUT_SL_ATR_MULT = float(os.environ.get("BREAKOUT_SL_ATR_MULT", "0.6"))
 BREAKOUT_TP_ATR_MULT = float(os.environ.get("BREAKOUT_TP_ATR_MULT", "2.0"))
 BREAKOUT_VOL_REGIME_MAX_PCT = float(os.environ.get("BREAKOUT_VOL_REGIME_MAX_PCT", "5.0"))
+
+# === PROBE TRADE mode (2026-05-10) ===
+# For coins with thin/no historical trade data, take small "probe" trades on
+# breakouts to build dataset for RAG memory + decision_logger learning.
+# Auto-graduates to standard BREAKOUT_OFFLIST after PROBE_GRADUATION_TRADES.
+PROBE_TRADE_ENABLED = os.environ.get("PROBE_TRADE", "0").lower() in ("1", "true", "yes")
+PROBE_RISK_PCT = float(os.environ.get("PROBE_RISK_PCT", "1.0"))
+PROBE_GRADUATION_TRADES = int(os.environ.get("PROBE_GRADUATION_TRADES", "4"))
+PROBE_DAILY_CAP_PER_COIN = int(os.environ.get("PROBE_DAILY_CAP_PER_COIN", "1"))
+DECISIONS_DB = SCRIPT_DIR / "data" / "decisions.db"
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +810,9 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
 
         # Gap 4: Explosive breakout entry path (parallel to standard EMA-cross detection)
         # Triggers ngay khi 1h candle range > 1.5 ATR + volume > 3x avg + 4h aligned.
-        # Off-allowlist coins use TIGHTER params (smaller risk, tighter SL/TP)
-        # because they're unverified and can fade hard.
+        # Coins are classified by allowlist membership + historical trade count
+        # (PROBE for untested/thin-history off-list coins; OFFLIST_ESTABLISHED
+        # for off-list coins with ≥PROBE_GRADUATION_TRADES; ALLOWLIST otherwise).
         if ind.get("explosive_burst"):
             burst_dir = ind.get("burst_direction")
             mtf_aligned = (
@@ -705,17 +820,19 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 (burst_dir == "SHORT" and ema_cross_4h in ("BEARISH", "UNKNOWN"))
             )
             if mtf_aligned:
-                # Pick params based on allowlist membership
-                if in_allowlist:
-                    sl_mult = 0.8
-                    tp_mult = 2.5
-                    risk_pct_override = None  # use global RISK_PER_TRADE_PCT
-                    mode_hint = "BREAKOUT"
-                else:
-                    sl_mult = BREAKOUT_SL_ATR_MULT
-                    tp_mult = BREAKOUT_TP_ATR_MULT
-                    risk_pct_override = BREAKOUT_RISK_PCT
-                    mode_hint = "BREAKOUT_OFFLIST"
+                tier_info = classify_coin_for_breakout(coin, in_allowlist)
+
+                # PROBE rate-limit: skip if exceeded daily cap for this coin
+                if tier_info["mode_hint"] == "BREAKOUT_PROBE":
+                    if not PROBE_TRADE_ENABLED:
+                        continue  # probe mode disabled → skip untested/thin coins
+                    if _probes_today_for_coin(coin) >= PROBE_DAILY_CAP_PER_COIN:
+                        continue  # already probed today
+
+                sl_mult = tier_info["sl_mult"]
+                tp_mult = tier_info["tp_mult"]
+                risk_pct_override = tier_info["risk_pct"]
+                mode_hint = tier_info["mode_hint"]
 
                 entry_b = round(price, 6)
                 if burst_dir == "LONG":
@@ -729,6 +846,8 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 signals.append({
                     "coin": coin, "symbol": symbol, "direction": burst_dir,
                     "strength": "EXPLOSIVE", "mode_hint": mode_hint,
+                    "tier": tier_info["tier"],
+                    "tier_reason": tier_info["reason"],
                     "in_allowlist": in_allowlist,
                     "entry": entry_b, "sl": sl_b, "tp": tp_b,
                     "sl_pct": round(abs(entry_b - sl_b) / entry_b * 100, 2),
@@ -1039,6 +1158,27 @@ def llm_review_signal(signal: dict, indicators: dict, active_count: int) -> dict
             f"  • CONFIRM only if there's a CLEAR catalyst pattern (vol burst + trend continuation)\n"
             f"Return mode='BREAKOUT' with sl_mult={BREAKOUT_SL_ATR_MULT}, "
             f"tp_mult={BREAKOUT_TP_ATR_MULT}, timeout_h=3 (faster exit for unknown coins).\n"
+        )
+    elif mode_hint == "BREAKOUT_PROBE":
+        atr_pct_v = signal.get("atr_pct", 0)
+        tier_reason = signal.get("tier_reason", "thin/no history")
+        breakout_block = (
+            f"\n🧪 PROBE TRADE — DATA ACQUISITION (small risk to build dataset)\n"
+            f"Reason: {tier_reason}\n"
+            f"Last 1h candle: range = {burst_range_atr}× ATR (>= 1.5), "
+            f"volume = {burst_vol_ratio}× avg (>= 3.0)\n"
+            f"Volatility: ATR/price = {atr_pct_v}% (allowed up to {BREAKOUT_VOL_REGIME_MAX_PCT}% for breakouts)\n"
+            f"Pre-set: SL {BREAKOUT_SL_ATR_MULT}×ATR, TP {BREAKOUT_TP_ATR_MULT}×ATR, "
+            f"risk ONLY {PROBE_RISK_PCT}% (probe-sized, max 1 trade/day per coin)\n"
+            f"GOAL: Generate trade outcome data for this untested coin so future\n"
+            f"signals can use RAG/few-shot context. Bias toward CONFIRM unless\n"
+            f"there's a CLEAR red flag — losing $2-3 to learn coin behavior is acceptable.\n"
+            f"REJECT only if:\n"
+            f"  • RSI > 80 (LONG) or < 20 (SHORT) — extreme exhaustion\n"
+            f"  • vol_ratio < 1.0 on entry candle — burst already faded\n"
+            f"  • 4h trend strongly conflicts (BEARISH for LONG with strength)\n"
+            f"Return mode='BREAKOUT' with sl_mult={BREAKOUT_SL_ATR_MULT}, "
+            f"tp_mult={BREAKOUT_TP_ATR_MULT}, timeout_h=3.\n"
         )
 
     prompt = f"""You are a crypto futures trading risk analyst. Review this signal, decide CONFIRM/REJECT, and classify the trade MODE.
@@ -1819,6 +1959,11 @@ def daemon_loop():
               f"| vol_cap={BREAKOUT_VOL_REGIME_MAX_PCT}%")
     else:
         print(f"[daemon] BREAKOUT OFF-ALLOWLIST: OFF (set BREAKOUT_OFFLIST=1 to enable)")
+    if PROBE_TRADE_ENABLED:
+        print(f"[daemon] PROBE TRADES: ON | risk={PROBE_RISK_PCT}% "
+              f"| graduation>={PROBE_GRADUATION_TRADES}t | cap={PROBE_DAILY_CAP_PER_COIN}/day per coin")
+    else:
+        print(f"[daemon] PROBE TRADES: OFF (set PROBE_TRADE=1 to enable)")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:
