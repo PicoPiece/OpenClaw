@@ -267,7 +267,7 @@ def daily_report():
     total_pnl = 0.0
     fills_yday = {}
     for symbol, cfg in config.items():
-        invest = float(cfg.get("investment_usd", 0))
+        invest = float(cfg.get("invested_usd", cfg.get("investment_usd", 0)))
         total_invest += invest
         sym_pnl = float(daily.get(yesterday, {}).get(symbol, 0))
         total_pnl += sym_pnl
@@ -308,7 +308,7 @@ def status():
         n_total = len(sym.get("trades", []))
         print(f"\n{symbol}:")
         print(f"  range: ${cfg['lower']}-${cfg['upper']}  stop: ${cfg.get('stop_lower')}-${cfg.get('stop_upper')}")
-        print(f"  invest: ${cfg.get('investment_usd')}  grids: {cfg.get('grids')}")
+        print(f"  invest: ${cfg.get('invested_usd', cfg.get('investment_usd'))}  grids: {cfg.get('grids')}")
         print(f"  current: ${cur}  fills tracked: {n_total}  last_id: {sym.get('last_trade_id')}")
     if state.get("daily_pnl"):
         print(f"\nDaily P&L (last 7 days):")

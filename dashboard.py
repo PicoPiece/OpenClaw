@@ -277,7 +277,15 @@ def api_asi():
 
 @app.route("/api/grid-bots")
 def api_grid_bots():
-    """Grid bot dashboard data: native Binance algo orders + tracked state."""
+    """Grid bot dashboard data: native Binance algo orders + tracked state.
+
+    Two P&L sources:
+      1. Wallet-anchored (canonical): Trading Bots wallet balance - sum_invested.
+         Reliable, since Binance native Spot Grid bots don't expose individual
+         fills via API for retail accounts.
+      2. Fill-based (legacy): aggregate state.daily_pnl from grid_monitor.py
+         tracked trades. Often empty for native grids — informational only.
+    """
     env = load_env()
     config = {}
     state = {"daily_pnl": {}, "fills_by_symbol": {}}
@@ -292,6 +300,33 @@ def api_grid_bots():
             state = json.loads(GRID_STATE_FILE.read_text())
         except Exception:
             pass
+
+    # === Wallet-anchored P&L ===
+    # Read latest "Trading Bots" wallet balance from wallet_balance_history.json
+    # and compute unrealized P&L = wallet - sum(invested_usd).
+    wallet_bots_now = None
+    wallet_bots_24h_ago = None
+    wallet_snap_ts = None
+    try:
+        wh_path = SCRIPT_DIR / "data" / "wallet_balance_history.json"
+        if wh_path.exists():
+            wh = json.loads(wh_path.read_text())
+            snaps = wh.get("snapshots", [])
+            if snaps:
+                latest = snaps[-1]
+                wallet_bots_now = float(latest.get("wallets", {}).get("Trading Bots", 0))
+                wallet_snap_ts = latest.get("ts")
+                # find 24h-ago snapshot
+                cutoff = datetime.fromisoformat(latest["ts"].replace("Z", "+00:00")) - timedelta(hours=24)
+                for s in reversed(snaps):
+                    try:
+                        if datetime.fromisoformat(s["ts"].replace("Z", "+00:00")) <= cutoff:
+                            wallet_bots_24h_ago = float(s.get("wallets", {}).get("Trading Bots", 0))
+                            break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
     native_orders, native_err = _signed_spot_get(env, "/sapi/v1/algo/spot/openOrders")
     native_active = native_orders.get("orders", []) if native_orders else []
@@ -313,7 +348,7 @@ def api_grid_bots():
     total_cumulative = 0.0
 
     for symbol, cfg in config.items():
-        invest = float(cfg.get("investment_usd", 0))
+        invest = float(cfg.get("invested_usd", cfg.get("investment_usd", 0)))
         total_invest += invest
         cur = _spot_price(symbol)
         lo, up = float(cfg["lower"]), float(cfg["upper"])
@@ -380,15 +415,53 @@ def api_grid_bots():
         except Exception:
             days_active = 1
 
+    # Wallet-anchored P&L (canonical for Binance native grid bots)
+    WARMUP_DAYS = 7
+    wallet_pnl_total = None
+    wallet_pnl_24h = None
+    wallet_pnl_pct = None
+    wallet_daily_avg = None
+    wallet_monthly_proj = None
+    is_warmup = days_active < WARMUP_DAYS
+    if wallet_bots_now is not None and total_invest > 0:
+        wallet_pnl_total = wallet_bots_now - total_invest
+        wallet_pnl_pct = (wallet_pnl_total / total_invest) * 100
+        if wallet_bots_24h_ago is not None:
+            wallet_pnl_24h = wallet_bots_now - wallet_bots_24h_ago
+        if days_active > 0:
+            wallet_daily_avg = wallet_pnl_total / days_active
+            # Don't project to 30d during warmup (slippage skews early days)
+            wallet_monthly_proj = wallet_daily_avg * 30 if not is_warmup else None
+
+    # Fill-based (legacy, often empty for native grids)
     daily_avg = (total_cumulative / days_active) if days_active else 0
     monthly_proj = daily_avg * 30
     roi_pct = (total_cumulative / total_invest * 100) if total_invest else 0
+
+    # Pick canonical P&L (prefer wallet-anchored if available)
+    pnl_canonical = wallet_pnl_total if wallet_pnl_total is not None else total_cumulative
+    pnl_canonical_pct = wallet_pnl_pct if wallet_pnl_pct is not None else roi_pct
+    pnl_source = "wallet" if wallet_pnl_total is not None else "fills"
 
     return jsonify({
         "summary": {
             "active_grids": native_count,
             "tracked_grids": len(config),
             "total_investment": round(total_invest, 2),
+            # Canonical P&L (use this for display)
+            "pnl_canonical": round(pnl_canonical, 2),
+            "pnl_canonical_pct": round(pnl_canonical_pct, 2),
+            "pnl_source": pnl_source,
+            "is_warmup": is_warmup,
+            "warmup_days": WARMUP_DAYS,
+            # Wallet-anchored detail
+            "wallet_balance_now": round(wallet_bots_now, 2) if wallet_bots_now is not None else None,
+            "wallet_pnl_total": round(wallet_pnl_total, 2) if wallet_pnl_total is not None else None,
+            "wallet_pnl_pct": round(wallet_pnl_pct, 2) if wallet_pnl_pct is not None else None,
+            "wallet_pnl_24h": round(wallet_pnl_24h, 2) if wallet_pnl_24h is not None else None,
+            "wallet_snapshot_ts": wallet_snap_ts,
+            "wallet_monthly_projection": round(wallet_monthly_proj, 2) if wallet_monthly_proj is not None else None,
+            # Fill-based legacy (empty for native grids)
             "pnl_today": round(total_today, 4),
             "pnl_cumulative": round(total_cumulative, 4),
             "roi_pct": round(roi_pct, 2),
@@ -1151,24 +1224,41 @@ function renderGrids(d) {
   }
 
   const sumGrid = document.getElementById('gridSummaryGrid');
-  if (grids.length === 0 && summary.active_grids === 0) {
+  if (grids.length === 0 && summary.active_grids === 0 && (summary.tracked_grids || 0) === 0) {
     sumGrid.innerHTML = '';
   } else {
-    const pTodayCls = summary.pnl_today >= 0 ? 'positive' : 'negative';
-    const pCumCls = summary.pnl_cumulative >= 0 ? 'positive' : 'negative';
+    // Canonical P&L (prefer wallet-anchored over fill-based)
+    const pCanon = summary.pnl_canonical ?? 0;
+    const pCanonPct = summary.pnl_canonical_pct ?? 0;
+    const pCanonCls = pCanon >= 0 ? 'positive' : 'negative';
+    const p24h = summary.wallet_pnl_24h;
+    const p24hStr = p24h !== null && p24h !== undefined
+      ? `${p24h >= 0 ? '+' : ''}$${p24h.toFixed(2)} 24h`
+      : '24h n/a';
+    const sourceTag = summary.pnl_source === 'wallet'
+      ? '<span style="font-size:10px; color:#10b981;">📊 wallet-anchored</span>'
+      : '<span style="font-size:10px; color:#f59e0b;">⚠ fill-based (incomplete)</span>';
+    const warmupBadge = summary.is_warmup
+      ? `<span style="font-size:10px; color:#f59e0b;">🔥 warmup ${summary.days_active}/${summary.warmup_days}d</span>`
+      : '';
+    const monthProjStr = summary.wallet_monthly_projection !== null && summary.wallet_monthly_projection !== undefined
+      ? `proj $${summary.wallet_monthly_projection.toFixed(0)}/mo`
+      : (summary.is_warmup ? 'proj n/a (warmup)' : 'proj n/a');
+    const walletNow = summary.wallet_balance_now;
+
     sumGrid.innerHTML = `
       <div class="card"><div class="card-title">Tracked Grids</div>
         <div class="card-value">${summary.tracked_grids}</div>
         <div class="card-sub">${summary.active_grids} active on Binance</div></div>
       <div class="card"><div class="card-title">Investment</div>
         <div class="card-value">$${summary.total_investment.toFixed(0)}</div>
-        <div class="card-sub">${summary.days_active}d running</div></div>
-      <div class="card"><div class="card-title">P&L Today</div>
-        <div class="card-value ${pTodayCls}">${summary.pnl_today >= 0 ? '+' : ''}$${summary.pnl_today.toFixed(2)}</div>
-        <div class="card-sub">Daily avg: $${summary.daily_avg.toFixed(2)}</div></div>
-      <div class="card"><div class="card-title">Cumulative</div>
-        <div class="card-value ${pCumCls}">${summary.pnl_cumulative >= 0 ? '+' : ''}$${summary.pnl_cumulative.toFixed(2)}</div>
-        <div class="card-sub">${summary.roi_pct >= 0 ? '+' : ''}${summary.roi_pct.toFixed(2)}% ROI · proj $${summary.monthly_projection.toFixed(0)}/mo</div></div>
+        <div class="card-sub">${summary.days_active}d running ${warmupBadge}</div></div>
+      <div class="card"><div class="card-title">Unrealized P&L</div>
+        <div class="card-value ${pCanonCls}">${pCanon >= 0 ? '+' : ''}$${pCanon.toFixed(2)}</div>
+        <div class="card-sub">${pCanonPct >= 0 ? '+' : ''}${pCanonPct.toFixed(2)}% ROI · ${sourceTag}</div></div>
+      <div class="card"><div class="card-title">Wallet & 24h</div>
+        <div class="card-value">${walletNow !== null && walletNow !== undefined ? '$' + walletNow.toFixed(0) : '--'}</div>
+        <div class="card-sub">${p24hStr} · ${monthProjStr}</div></div>
     `;
   }
 
