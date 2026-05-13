@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -32,6 +33,14 @@ COOLDOWN_HOURS = 1.0
 
 # Auth/IP-related Binance error codes that require manual intervention
 AUTH_ERROR_CODES = {-2015, -2014, -1022, -2008, -1021}
+
+# Number of consecutive transient failures (network/DNS/timeout) before alerting.
+# Single DNS hiccup → no alert; only persistent connectivity loss alerts.
+TRANSIENT_FAIL_THRESHOLD = 3
+
+# In-process retry on transient errors (DNS / connection reset / timeout)
+TRANSIENT_RETRY_COUNT = 2
+TRANSIENT_RETRY_DELAY_S = 5.0
 
 
 def load_env():
@@ -117,8 +126,31 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def check_binance() -> tuple[bool, str | None, int | None]:
-    """Returns (ok, error_message, error_code)."""
+TRANSIENT_ERROR_FRAGMENTS = (
+    "name resolution",
+    "nameresolutionerror",
+    "temporary failure in name resolution",
+    "max retries exceeded",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "read timed out",
+    "timed out",
+    "connectionerror",
+    "remotedisconnected",
+)
+
+
+def is_transient_error(msg: str) -> bool:
+    """True if the error looks like a flaky network / DNS issue (not an auth problem)."""
+    if not msg:
+        return False
+    low = msg.lower()
+    return any(frag in low for frag in TRANSIENT_ERROR_FRAGMENTS)
+
+
+def _check_binance_once() -> tuple[bool, str | None, int | None]:
+    """Single attempt — returns (ok, error_message, error_code)."""
     api_key = os.environ.get("BINANCE_API_KEY")
     api_secret = os.environ.get("BINANCE_API_SECRET")
     if not (api_key and api_secret):
@@ -136,6 +168,29 @@ def check_binance() -> tuple[bool, str | None, int | None]:
         return False, f"{e}", getattr(e, "code", None)
     except Exception as e:
         return False, f"network/unknown: {e}", None
+
+
+def check_binance() -> tuple[bool, str | None, int | None]:
+    """Returns (ok, error_message, error_code).
+
+    On transient errors (DNS / connection reset / timeout), retries up to
+    TRANSIENT_RETRY_COUNT times with TRANSIENT_RETRY_DELAY_S between attempts.
+    Auth errors (e.g. -2015 IP whitelist) fail fast on first attempt.
+    """
+    last_err: str | None = None
+    last_code: int | None = None
+    attempts = 1 + TRANSIENT_RETRY_COUNT
+    for i in range(attempts):
+        ok, err, code = _check_binance_once()
+        if ok:
+            return True, None, None
+        last_err, last_code = err, code
+        if not is_transient_error(err or ""):
+            return False, err, code
+        if i < attempts - 1:
+            print(f"[transient] attempt {i+1}/{attempts} failed ({err[:80]}...), retrying in {TRANSIENT_RETRY_DELAY_S}s")
+            time.sleep(TRANSIENT_RETRY_DELAY_S)
+    return False, last_err, last_code
 
 
 def main():
@@ -162,16 +217,35 @@ def main():
         })
         return 0
 
-    # FAILING path
+    # FAILING path — distinguish auth errors (alert immediately) from transient
+    # network/DNS errors (require N consecutive failures before alerting).
     is_auth_err = code in AUTH_ERROR_CODES
+    is_transient = is_transient_error(err or "") and not is_auth_err
     current_ip = get_public_ip()
     prev_status = state.get("status", "OK")
     prev_alert_ip = state.get("current_ip")
     last_alert = parse_iso(state.get("last_alert_ts") or "")
+    transient_streak = state.get("transient_streak", 0)
 
     should_alert = False
     reason = ""
-    if prev_status != "FAILING":
+    if is_transient:
+        transient_streak += 1
+        if transient_streak < TRANSIENT_FAIL_THRESHOLD:
+            print(f"[transient] streak {transient_streak}/{TRANSIENT_FAIL_THRESHOLD} — suppressing alert ({err[:80]})")
+            # save streak but don't alert / don't flip status to FAILING
+            save_state({
+                **state,
+                "transient_streak": transient_streak,
+                "last_check_ts": now_iso(),
+                "last_error": err,
+                "last_error_code": code,
+            })
+            return 0
+        # threshold breached → upgrade to a real alert
+        reason = f"transient threshold breached ({transient_streak} consecutive)"
+        should_alert = True
+    elif prev_status != "FAILING":
         should_alert = True
         reason = "first failure"
     elif current_ip != prev_alert_ip and current_ip != "unknown":
@@ -200,6 +274,14 @@ def main():
                 f"Trade executor & position manager are halted until fixed.\n"
                 f"Detail: `{err[:200]}`"
             )
+        elif is_transient:
+            msg = (
+                "🌐 *Binance API: persistent network issue*\n"
+                f"{transient_streak} consecutive transient failures (DNS/timeout/conn-reset).\n"
+                f"Public IP: `{current_ip}`\n"
+                f"Likely ISP DNS / connectivity issue, not a Binance/auth problem.\n"
+                f"Detail: `{err[:250]}`"
+            )
         else:
             msg = (
                 "⚠️ *Binance API check failed*\n"
@@ -225,6 +307,7 @@ def main():
         "last_error": err,
         "last_error_code": code,
         "last_check_ts": now_iso(),
+        "transient_streak": transient_streak if is_transient else 0,
     })
     return 1
 
