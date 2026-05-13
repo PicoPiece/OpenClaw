@@ -70,13 +70,76 @@ DEFAULT_DAILY_LOSS_LIMIT = 10.0
 DEFAULT_CIRCUIT_BREAKER = 3
 DEFAULT_EXEC_INTERVAL = 15
 
-FUTURES_SYMBOL_MAP = {
-    "btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "bnb": "BNBUSDT",
-    "xrp": "XRPUSDT", "doge": "DOGEUSDT", "ada": "ADAUSDT", "avax": "AVAXUSDT",
-    "link": "LINKUSDT", "aave": "AAVEUSDT", "trx": "TRXUSDT", "zec": "ZECUSDT",
-    "sui": "SUIUSDT", "ton": "TONUSDT", "pepe": "1000PEPEUSDT", "ordi": "ORDIUSDT",
-    "tao": "TAOUSDT", "edu": "EDUUSDT",
+# Hardcoded fallback / overrides for non-trivial mappings (e.g. 1000-multiplied symbols).
+# The actual map is built dynamically at runtime from Binance Futures exchangeInfo so that
+# every USDT-margined perpetual is automatically supported.
+_FUTURES_SYMBOL_OVERRIDES = {
+    "pepe": "1000PEPEUSDT",
+    "shib": "1000SHIBUSDT",
+    "bonk": "1000BONKUSDT",
+    "floki": "1000FLOKIUSDT",
+    "lunc": "1000LUNCUSDT",
+    "xec": "1000XECUSDT",
+    "rats": "1000RATSUSDT",
+    "sats": "1000SATSUSDT",
 }
+
+# Built dynamically by `_build_futures_symbol_map()` — populated at startup and refreshed
+# every FUTURES_SYMBOL_REFRESH_HOURS hours. Falls back to overrides if API call fails.
+FUTURES_SYMBOL_MAP: dict = dict(_FUTURES_SYMBOL_OVERRIDES)
+_FUTURES_SYMBOL_MAP_REFRESHED_AT = 0.0
+FUTURES_SYMBOL_REFRESH_HOURS = 6.0
+
+
+def _build_futures_symbol_map(client) -> dict:
+    """Query Binance Futures exchangeInfo and build coin->symbol map for all USDT perpetuals.
+
+    Returns a dict like {"btc": "BTCUSDT", "near": "NEARUSDT", ...} — covering every
+    TRADING USDT-margined perpetual contract. Hardcoded overrides take priority for
+    1000-multiplied symbols (PEPE, SHIB, etc).
+    """
+    new_map = dict(_FUTURES_SYMBOL_OVERRIDES)
+    try:
+        info = client.futures_exchange_info()
+        for s in info.get("symbols", []):
+            if s.get("status") != "TRADING":
+                continue
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("quoteAsset") != "USDT":
+                continue
+            symbol = s["symbol"]
+            base = (s.get("baseAsset") or "").lower()
+            if not base:
+                continue
+            # Skip 1000-prefixed symbols here (handled by overrides above)
+            if symbol.startswith("1000"):
+                continue
+            # Don't overwrite an explicit override
+            if base not in new_map:
+                new_map[base] = symbol
+    except Exception as exc:
+        log.warning(f"Failed to refresh futures symbol map: {exc} — using existing map ({len(new_map)} entries)")
+    return new_map
+
+
+def _maybe_refresh_futures_symbol_map(client, force: bool = False):
+    """Refresh FUTURES_SYMBOL_MAP if stale (>FUTURES_SYMBOL_REFRESH_HOURS hours)."""
+    global FUTURES_SYMBOL_MAP, _FUTURES_SYMBOL_MAP_REFRESHED_AT
+    age_h = (time.time() - _FUTURES_SYMBOL_MAP_REFRESHED_AT) / 3600.0
+    if not force and age_h < FUTURES_SYMBOL_REFRESH_HOURS:
+        return
+    new_map = _build_futures_symbol_map(client)
+    if len(new_map) >= len(FUTURES_SYMBOL_MAP):
+        added = set(new_map) - set(FUTURES_SYMBOL_MAP)
+        removed = set(FUTURES_SYMBOL_MAP) - set(new_map)
+        FUTURES_SYMBOL_MAP = new_map
+        _FUTURES_SYMBOL_MAP_REFRESHED_AT = time.time()
+        if added or removed:
+            log.info(f"Futures symbol map refreshed: {len(FUTURES_SYMBOL_MAP)} pairs "
+                     f"(+{len(added)} -{len(removed)})")
+        else:
+            log.info(f"Futures symbol map refreshed: {len(FUTURES_SYMBOL_MAP)} pairs (no change)")
 
 
 def load_dotenv():
@@ -825,11 +888,18 @@ def daemon_loop():
 
     executor = BinanceExecutor()
 
+    # Build futures symbol map dynamically — supports every USDT-margined perpetual.
+    # Hardcoded map only had 18 coins, missing NEAR/ATOM/ENA/INJ/ONDO/UNI/ASTER → caused
+    # silent failures of LLM-CONFIRMed trades.
+    _maybe_refresh_futures_symbol_map(executor.client, force=True)
+    log.info(f"Futures symbol map: {len(FUTURES_SYMBOL_MAP)} pairs loaded")
+
     trading_state = load_trading_state()
     sync_positions(executor, trading_state)
 
     while True:
         try:
+            _maybe_refresh_futures_symbol_map(executor.client)  # refreshes every 6h
             trading_state = load_trading_state()
             executor_state = load_executor_state()
 
