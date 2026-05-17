@@ -700,10 +700,16 @@ def check_position_status(executor: BinanceExecutor, trading_state: dict,
         executor_state["daily_pnl"] = executor_state.get("daily_pnl", 0) + pnl
         executor_state["total_pnl"] = executor_state.get("total_pnl", 0) + pnl
 
-        if is_sl:
+        # Only count AUTO losses toward consec_losses kill switch.
+        # Manual losses (off-allowlist user trades) should not halt auto-trade.
+        # source defaults to "auto" here because this position was opened by trade_executor.
+        is_imported = cs.get("is_imported", False)
+        trade_source = "manual" if is_imported else "auto"
+        if is_sl and trade_source == "auto":
             executor_state["consecutive_losses"] = executor_state.get("consecutive_losses", 0) + 1
-        else:
+        elif is_tp and trade_source == "auto":
             executor_state["consecutive_losses"] = 0
+        # Manual losses: do not modify consec_losses (leave for risk_guardian to decide)
 
         history_entry = {
             "coin": coin,
@@ -713,6 +719,9 @@ def check_position_status(executor: BinanceExecutor, trading_state: dict,
             "pnl": round(pnl, 4),
             "result": new_state,
             "time": datetime.now(timezone.utc).isoformat(),
+            "source": trade_source,
+            "order_id": cs.get("order_id"),
+            "decision_id": cs.get("decision_id"),
         }
         executor_state.setdefault("trade_history", []).append(history_entry)
         if len(executor_state["trade_history"]) > 100:

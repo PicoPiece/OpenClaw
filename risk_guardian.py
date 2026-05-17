@@ -110,9 +110,65 @@ def get_binance_wallet() -> float | None:
         return None
 
 
+CONSEC_LOSS_STALE_HOURS = 72.0  # Losses older than this don't count toward halt
+
+
+def _auto_only_consec_losses(history: list[dict]) -> int:
+    """Count tail consecutive losses, skipping manual trades.
+
+    Default behaviour for legacy entries without 'source' field: treat as auto
+    (preserve old kill-switch semantics for un-tagged trades).
+
+    Stale auto-loss chains (oldest loss older than CONSEC_LOSS_STALE_HOURS)
+    return 0 — prevents indefinite halt when no new auto trades have happened.
+    """
+    consec = 0
+    oldest_loss_ts = None
+    for t in reversed(history or []):
+        src = t.get("source", "auto")
+        if src == "manual":
+            continue
+        pnl = t.get("pnl") or 0
+        if pnl < 0:
+            consec += 1
+            oldest_loss_ts = t.get("time")
+        elif pnl > 0:
+            break
+    # Staleness check: if the oldest loss in the streak is too old, treat as stale
+    if oldest_loss_ts and consec > 0:
+        try:
+            oldest_dt = datetime.fromisoformat(oldest_loss_ts.replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - oldest_dt).total_seconds() / 3600
+            if age_h > CONSEC_LOSS_STALE_HOURS:
+                return 0
+        except Exception:
+            pass
+    return consec
+
+
+def _auto_only_daily_pnl(history: list[dict], today_iso: str) -> float:
+    """Sum today's pnl excluding manual trades."""
+    total = 0.0
+    for t in history or []:
+        if (t.get("time") or "").startswith(today_iso):
+            if t.get("source") == "manual":
+                continue
+            total += float(t.get("pnl") or 0)
+    return round(total, 4)
+
+
 def evaluate(es: dict, ts: dict) -> dict:
-    daily_pnl = float(es.get("daily_pnl") or 0)
-    consec = int(es.get("consecutive_losses") or 0)
+    history = es.get("trade_history") or []
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    # Recompute from history with auto-only filter — supersedes stored counter
+    # if history is present (defensive; existing counter may be inflated by
+    # partial-fill duplicates or manual trades incorrectly attributed to auto).
+    if history:
+        consec = _auto_only_consec_losses(history)
+        daily_pnl = _auto_only_daily_pnl(history, today_iso)
+    else:
+        consec = int(es.get("consecutive_losses") or 0)
+        daily_pnl = float(es.get("daily_pnl") or 0)
     starting = float(es.get("starting_balance") or 0) or 1.0
     live_balance = get_binance_wallet()
     if live_balance is not None:
@@ -151,6 +207,7 @@ def evaluate(es: dict, ts: dict) -> dict:
         "actions": actions,
         "warnings": warnings,
         "level": "ACTION" if actions else ("WARN" if warnings else "OK"),
+        "auto_only_mode": bool(history),
     }
 
 

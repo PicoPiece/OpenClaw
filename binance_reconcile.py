@@ -224,21 +224,153 @@ def _trade_key(t: dict) -> tuple:
     return (t.get("coin"), t.get("time"), round(t.get("pnl", 0), 2))
 
 
+def _ts_to_dt(ts_str: str | None):
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _find_fuzzy_duplicate(history: list[dict], record: dict,
+                          window_min: int = 6) -> dict | None:
+    """Return existing history entry that likely refers to the same close.
+
+    Match criteria: same coin AND time within window_min minutes AND same pnl sign.
+    Used to detect when binance_reconcile would create a duplicate of an entry
+    already added by trade_executor.check_position_status (or vice versa).
+    """
+    r_dt = _ts_to_dt(record.get("time"))
+    if not r_dt:
+        return None
+    r_coin = record.get("coin")
+    r_sign = 1 if (record.get("pnl") or 0) > 0 else (-1 if (record.get("pnl") or 0) < 0 else 0)
+    for h in history:
+        if h.get("coin") != r_coin:
+            continue
+        h_dt = _ts_to_dt(h.get("time"))
+        if not h_dt:
+            continue
+        dt_min = abs((r_dt - h_dt).total_seconds()) / 60.0
+        if dt_min > window_min:
+            continue
+        h_sign = 1 if (h.get("pnl") or 0) > 0 else (-1 if (h.get("pnl") or 0) < 0 else 0)
+        if h_sign != 0 and r_sign != 0 and h_sign != r_sign:
+            continue
+        return h
+    return None
+
+
+def _determine_source(record: dict, trading_state: dict) -> str:
+    """Cross-reference trading_state to classify a reconciled trade as auto vs manual.
+
+    Logic:
+    - If trading_state.states[coin] has a recently-closed entry (executed_at within
+      ±2h of trade time) with state in {TP_HIT, SL_HIT, TIMEOUT_*, EMERGENCY_*}
+      AND order_id was set by trade_executor → auto.
+    - Else → manual (user opened via Binance UI / mobile, not via signal pipeline).
+    """
+    coin = record.get("coin")
+    r_dt = _ts_to_dt(record.get("time"))
+    if not coin or not r_dt:
+        return "manual"
+    cs = (trading_state.get("states") or {}).get(coin)
+    if not cs:
+        return "manual"
+    # check executed_at / closed_at proximity
+    for k in ("executed_at", "closed_at", "fill_time"):
+        ts = _ts_to_dt(cs.get(k))
+        if ts and abs((r_dt - ts).total_seconds()) <= 2 * 3600:
+            order_id = cs.get("order_id") or ""
+            if order_id and "manual" not in str(order_id).lower() and not cs.get("is_imported"):
+                return "auto"
+            break
+    return "manual"
+
+
+CONSEC_LOSS_STALE_HOURS = 72.0
+
+
+def _count_auto_consec_losses(history: list[dict]) -> int:
+    """Count consecutive losing trades from the tail, ONLY among auto trades.
+
+    Manual trades are skipped (neither resets nor increments the streak) so
+    that user's discretionary trades don't trip the auto-trade kill switch.
+
+    Returns 0 if the oldest loss in the streak is older than
+    CONSEC_LOSS_STALE_HOURS (prevents stuck halt when no new auto trades happen).
+    Mirrors logic in risk_guardian._auto_only_consec_losses to stay consistent.
+    """
+    consec = 0
+    oldest_loss_ts = None
+    for t in reversed(history):
+        src = t.get("source", "auto")
+        if src == "manual":
+            continue
+        pnl = t.get("pnl") or 0
+        if pnl < 0:
+            consec += 1
+            oldest_loss_ts = t.get("time")
+        elif pnl > 0:
+            break
+    if oldest_loss_ts and consec > 0:
+        try:
+            oldest_dt = datetime.fromisoformat(oldest_loss_ts.replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - oldest_dt).total_seconds() / 3600
+            if age_h > CONSEC_LOSS_STALE_HOURS:
+                return 0
+        except Exception:
+            pass
+    return consec
+
+
 def patch_executor_state(records: list[dict], apply: bool) -> dict:
     es = json.loads(EXEC_STATE.read_text()) if EXEC_STATE.exists() else {}
     history = list(es.get("trade_history", []))
+
+    # Load trading_state for source classification
+    ts_data = {}
+    if TRADING_STATE.exists():
+        try:
+            ts_data = json.loads(TRADING_STATE.read_text())
+        except Exception:
+            ts_data = {}
+
     existing_keys = {_trade_key(t) for t in history}
     added = []
+    skipped_duplicates = 0
+    enriched = 0
+
     for r in records:
+        source = _determine_source(r, ts_data)
         local = {"coin": r["coin"], "direction": r["direction"],
                  "entry": r["entry"], "close": r["close"],
                  "pnl": r["pnl"], "result": r["result"],
                  "time": r["time"], "qty": r["qty"], "fee": r["fee"],
-                 "source": "binance_reconcile"}
+                 "source": source}
+        # 1. exact key dedup
         if _trade_key(local) in existing_keys:
+            skipped_duplicates += 1
+            continue
+        # 2. fuzzy dedup (same coin within 6 min, same pnl sign)
+        fuzzy = _find_fuzzy_duplicate(history, local)
+        if fuzzy is not None:
+            # Enrich existing entry with reconcile fields but DON'T add duplicate
+            for field in ("qty", "fee", "entry", "close"):
+                if not fuzzy.get(field) and local.get(field):
+                    fuzzy[field] = local[field]
+            # Preserve source: prefer existing if it's "auto" (since trade_executor sets that)
+            if not fuzzy.get("source"):
+                fuzzy["source"] = source
+            enriched += 1
+            skipped_duplicates += 1
             continue
         added.append(local)
-    new_history = sorted(history + added, key=lambda t: t.get("time", ""))
+        history.append(local)  # so subsequent fuzzy checks see it
+        existing_keys.add(_trade_key(local))
+
+    new_history = sorted(history, key=lambda t: t.get("time", ""))
     tracking_since = (es.get("tracking_since") or "")[:10]
     if tracking_since:
         session_history = [t for t in new_history
@@ -249,17 +381,15 @@ def patch_executor_state(records: list[dict], apply: bool) -> dict:
     total_trades = len(session_history)
     today = datetime.now(timezone.utc).date().isoformat()
     daily_pnl = round(sum(t.get("pnl", 0) for t in new_history
-                            if (t.get("time") or "").startswith(today)), 4)
-    consecutive = 0
-    for t in reversed(new_history):
-        if (t.get("pnl") or 0) < 0:
-            consecutive += 1
-        else:
-            break
+                            if (t.get("time") or "").startswith(today)
+                            and t.get("source") != "manual"), 4)
+    consecutive = _count_auto_consec_losses(new_history)
 
     summary = {
         "added_count": len(added),
-        "total_trades_before": len(history),
+        "skipped_duplicates": skipped_duplicates,
+        "enriched_existing": enriched,
+        "total_trades_before": len(es.get("trade_history", [])),
         "total_trades_after": total_trades,
         "total_pnl_before": round(es.get("total_pnl", 0), 4),
         "total_pnl_after": total_pnl,
@@ -267,7 +397,7 @@ def patch_executor_state(records: list[dict], apply: bool) -> dict:
         "consecutive_losses_after": consecutive,
         "added_sample": added[:5],
     }
-    if apply and added:
+    if apply:
         es["trade_history"] = new_history
         es["total_pnl"] = total_pnl
         es["total_trades"] = total_trades

@@ -1066,10 +1066,14 @@ def manage_positions():
             es["daily_pnl"] = es.get("daily_pnl", 0) + net_pnl
             es["total_pnl"] = es.get("total_pnl", 0) + net_pnl
             es["total_trades"] = es.get("total_trades", 0) + 1
-            if net_pnl < 0:
-                es["consecutive_losses"] = es.get("consecutive_losses", 0) + 1
-            else:
-                es["consecutive_losses"] = 0
+            # Only count auto closes toward kill switch — manual imports don't.
+            is_imported = cs.get("is_imported", False)
+            trade_source = "manual" if is_imported else "auto"
+            if trade_source == "auto":
+                if net_pnl < 0:
+                    es["consecutive_losses"] = es.get("consecutive_losses", 0) + 1
+                else:
+                    es["consecutive_losses"] = 0
             es.setdefault("trade_history", []).append({
                 "coin": coin, "direction": direction,
                 "entry": entry, "close": current_price,
@@ -1077,6 +1081,8 @@ def manage_positions():
                 "result": "TP_HIT" if net_pnl > 0 else "SL_HIT",
                 "time": datetime.now(timezone.utc).isoformat(),
                 "note": f"LLM advised close: {reason}",
+                "source": trade_source,
+                "order_id": cs.get("order_id"),
             })
             save_executor_state(es)
 
