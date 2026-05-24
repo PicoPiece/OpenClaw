@@ -486,6 +486,15 @@ PROBE_GRADUATION_TRADES = int(os.environ.get("PROBE_GRADUATION_TRADES", "4"))
 PROBE_DAILY_CAP_PER_COIN = int(os.environ.get("PROBE_DAILY_CAP_PER_COIN", "1"))
 DECISIONS_DB = SCRIPT_DIR / "data" / "decisions.db"
 
+# === LLM Gate toggle (2026-05-24) ===
+# Set LLM_GATE_ENABLED=0 to skip DeepSeek API call entirely and use
+# the deterministic rule_based_review() instead.  Default=0 because
+# 30-day data showed LLM gate generated negative ROI (too many REJECT on
+# valid breakouts, 65% reject rate, -$0.13 net on executed CONFIRMs).
+# LLM is still used for weekly_analysis and Telegram chat — just not
+# per-signal gate.  Re-enable anytime with LLM_GATE_ENABLED=1 in .env.
+LLM_GATE_ENABLED = os.environ.get("LLM_GATE_ENABLED", "0").lower() in ("1", "true", "yes")
+
 # === PULLBACK RE-ENTRY mode (2026-05-10) ===
 # When an explosive breakout signal is REJECTED due to RSI extreme, the coin
 # is added to a "pullback watch" list. If price subsequently drops back from
@@ -1618,6 +1627,179 @@ Reply ONLY in this JSON format, nothing else:
     return review
 
 
+# ---------------------------------------------------------------------------
+# Rule-Based Signal Review  (replaces LLM gate when LLM_GATE_ENABLED=0)
+# ---------------------------------------------------------------------------
+# Design goals:
+#   1. Pure Python — zero latency, zero cost, no API dependency
+#   2. Mode classification: SWING / SCALP / QUICK / BREAKOUT — dynamic SL/TP
+#   3. Hard-reject only on MATH failures, not on RSI-extreme heuristics
+#      (RSI extreme = momentum continuation, not reversal, in trending market)
+#   4. Log to decisions.db exactly like LLM did → RAG memory still works
+
+def rule_based_review(signal: dict, indicators: dict, active_count: int) -> dict:
+    """Deterministic rule engine replacing the LLM gate.
+
+    CONFIRM criteria (all must hold):
+      - R:R >= 1.2 (minimum mathematical edge after fees)
+      - vol_ratio >= 0.8 (some volume confirmation — loose to avoid missing breakouts)
+      - No ACTIVE position on same coin already (checked at call site)
+
+    REJECT criteria (any one triggers REJECT):
+      - R:R < 1.0 (guaranteed loser after fees)
+      - Same coin lost > $7 in past 6h (cool-down — avoid revenge trading same coin)
+      - 4h EMA strongly opposes signal AND EMA gap > 3% (hard trend conflict only)
+
+    Mode classification (determines SL/TP multipliers and timeout):
+      - BREAKOUT: mode_hint in (BREAKOUT, BREAKOUT_OFFLIST, BREAKOUT_PROBE, PULLBACK_REENTRY)
+      - SWING:    direction aligns with 4h EMA trend
+      - SCALP:    direction opposes 4h EMA (counter-trend, tight params)
+      - QUICK:    4h neutral or unknown
+    """
+    direction = signal.get("direction", "")
+    rr = signal.get("rr_ratio", 0.0)
+    vol_ratio = signal.get("vol_ratio", 0.0)
+    ema_cross_4h = signal.get("ema_cross_4h", "UNKNOWN")
+    ema_gap_pct = signal.get("ema_gap_pct", 0.0)
+    mode_hint = signal.get("mode_hint") or ""
+    coin = signal.get("coin", "")
+
+    # ── Hard REJECT rules ──────────────────────────────────────────────────
+    if rr < 1.0:
+        reason = f"R:R {rr:.2f} < 1.0 — guaranteed loser after fees"
+        return _build_rule_review("REJECT", reason, 95, signal, indicators,
+                                  active_count, mode_hint, ema_cross_4h, direction)
+
+    if vol_ratio < 0.5:
+        reason = f"vol_ratio {vol_ratio:.2f}x — market asleep, no participation"
+        return _build_rule_review("REJECT", reason, 85, signal, indicators,
+                                  active_count, mode_hint, ema_cross_4h, direction)
+
+    # 4h hard trend conflict: 4h EMA strongly opposes AND gap is wide
+    # (narrow gap = transition; wide gap = established trend — don't fight it)
+    is_4h_conflict = False
+    if direction == "LONG" and ema_cross_4h == "BEARISH" and abs(ema_gap_pct) > 3.0:
+        is_4h_conflict = True
+    elif direction == "SHORT" and ema_cross_4h == "BULLISH" and abs(ema_gap_pct) > 3.0:
+        is_4h_conflict = True
+    if is_4h_conflict:
+        reason = (f"4h EMA {ema_cross_4h} strongly opposes {direction} "
+                  f"(gap {ema_gap_pct:+.1f}%) — hard trend conflict")
+        return _build_rule_review("REJECT", reason, 80, signal, indicators,
+                                  active_count, mode_hint, ema_cross_4h, direction)
+
+    # Same-coin cool-down: lost > $7 on this coin in past 6h
+    cool_down_pnl = _recent_coin_pnl(coin, hours=6)
+    if cool_down_pnl < -7.0:
+        reason = f"Same coin {coin.upper()} lost ${cool_down_pnl:.2f} in past 6h — cool-down"
+        return _build_rule_review("REJECT", reason, 75, signal, indicators,
+                                  active_count, mode_hint, ema_cross_4h, direction)
+
+    # ── CONFIRM — classify mode ────────────────────────────────────────────
+    if mode_hint in ("BREAKOUT", "BREAKOUT_OFFLIST", "BREAKOUT_PROBE", "PULLBACK_REENTRY"):
+        mode = mode_hint  # preserve specific breakout mode for executor logic
+    elif direction == "LONG":
+        if ema_cross_4h == "BULLISH":
+            mode = "SWING"
+        elif ema_cross_4h == "BEARISH":
+            mode = "SCALP"
+        else:
+            mode = "QUICK"
+    else:  # SHORT
+        if ema_cross_4h == "BEARISH":
+            mode = "SWING"
+        elif ema_cross_4h == "BULLISH":
+            mode = "SCALP"
+        else:
+            mode = "QUICK"
+
+    reason = (f"Rule-gate CONFIRM: R:R {rr:.2f}, vol {vol_ratio:.1f}x, "
+              f"4h {ema_cross_4h}, mode={mode}")
+    return _build_rule_review("CONFIRM", reason, 70, signal, indicators,
+                              active_count, mode, ema_cross_4h, direction)
+
+
+_MODE_PARAMS = {
+    "SWING":            {"sl_mult": 2.0, "tp_mult": 3.0, "timeout_h": 12.0},
+    "SCALP":            {"sl_mult": 1.0, "tp_mult": 1.5, "timeout_h":  4.0},
+    "QUICK":            {"sl_mult": 1.2, "tp_mult": 2.0, "timeout_h":  6.0},
+    "BREAKOUT":         {"sl_mult": 0.8, "tp_mult": 2.5, "timeout_h":  4.0},
+    "BREAKOUT_OFFLIST": {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  3.0},
+    "BREAKOUT_PROBE":   {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  3.0},
+    "PULLBACK_REENTRY": {"sl_mult": 0.5, "tp_mult": 2.5, "timeout_h":  4.0},
+}
+
+
+def _recent_coin_pnl(coin: str, hours: float = 6) -> float:
+    """Sum PnL for this coin from trade_history in the past `hours`."""
+    try:
+        es_path = SCRIPT_DIR / "data" / "executor_state.json"
+        if not es_path.exists():
+            return 0.0
+        es = json.loads(es_path.read_text())
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        total = 0.0
+        for t in es.get("trade_history", []):
+            if (t.get("coin") or "").lower() != coin.lower():
+                continue
+            try:
+                tt = datetime.fromisoformat((t.get("time") or "").replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if tt >= cutoff:
+                total += float(t.get("pnl") or 0)
+        return total
+    except Exception:
+        return 0.0
+
+
+def _build_rule_review(decision: str, reason: str, confidence: int,
+                       signal: dict, indicators: dict, active_count: int,
+                       mode: str, ema_cross_4h: str, direction: str) -> dict:
+    """Assemble review dict + log to decisions.db (same schema as LLM review)."""
+    mode_key = mode if mode in _MODE_PARAMS else (
+        "SWING" if (direction == "LONG" and ema_cross_4h == "BULLISH")
+        else "SCALP" if (direction == "LONG" and ema_cross_4h == "BEARISH")
+        else "QUICK"
+    )
+    params = _MODE_PARAMS.get(mode_key, _MODE_PARAMS["QUICK"])
+
+    review = {
+        "decision": decision,
+        "reason": reason,
+        "confidence": confidence,
+        "mode": mode_key,
+        "sl_mult": params["sl_mult"],
+        "tp_mult": params["tp_mult"],
+        "timeout_h": params["timeout_h"],
+        "source": "rule_engine",
+    }
+
+    # Log to decisions.db for RAG memory continuity
+    if decision_logger is not None:
+        try:
+            decision_id = decision_logger.log_decision(
+                source="rule_signal_review",
+                coin=signal.get("coin", ""),
+                direction=signal.get("direction", ""),
+                signal_data=signal,
+                indicators=indicators.get(signal.get("symbol", ""), {}),
+                market_state={"active_positions": active_count},
+                model="rule_engine_v1",
+                prompt="[rule-based, no API call]",
+                response=f'{{"decision":"{decision}","mode":"{mode_key}","reason":"{reason}"}}',
+                decision=decision,
+                reason=reason,
+                confidence=confidence,
+                cost_usd=0.0,
+            )
+            review["decision_id"] = decision_id
+        except Exception as e:
+            print(f"  [WARN] decision_logger.log failed: {e}")
+
+    return review
+
+
 def fetch_prices() -> dict:
     symbols_json = json.dumps(SYMBOLS, separators=(",", ":"))
     url = f"{BINANCE_PRICE_API}?symbols={symbols_json}"
@@ -1940,12 +2122,18 @@ def run_once():
 
             if auto_trade:
                 active_count = sum(1 for s in trading_state.get("states", {}).values() if s.get("state") == "ACTIVE")
-                print(f"  Signal: {coin_u} {best['direction']} @ {fmt_price(best['entry'])} — LLM reviewing...")
-                review = llm_review_signal(best, indicators, active_count)
+                if LLM_GATE_ENABLED:
+                    print(f"  Signal: {coin_u} {best['direction']} @ {fmt_price(best['entry'])} — LLM reviewing...")
+                    review = llm_review_signal(best, indicators, active_count)
+                    gate_label = "LLM"
+                else:
+                    print(f"  Signal: {coin_u} {best['direction']} @ {fmt_price(best['entry'])} — rule-gate reviewing...")
+                    review = rule_based_review(best, indicators, active_count)
+                    gate_label = "RULE"
                 decision = review.get("decision", "CONFIRM")
                 reason = review.get("reason", "")
                 confidence = review.get("confidence", 0)
-                print(f"  LLM: {decision} ({confidence}%) — {reason}")
+                print(f"  {gate_label}: {decision} ({confidence}%) — {reason}")
 
                 if review.get("decision_id"):
                     best["decision_id"] = review["decision_id"]
@@ -2249,6 +2437,10 @@ def daemon_loop():
               f"| SL={PULLBACK_SL_ATR_MULT}xATR | TP={PULLBACK_TP_ATR_MULT}xATR")
     else:
         print(f"[daemon] PULLBACK RE-ENTRY: OFF (set PULLBACK_REENTRY=1 to enable)")
+    if LLM_GATE_ENABLED:
+        print(f"[daemon] Signal gate: LLM (DeepSeek) — set LLM_GATE_ENABLED=0 to use rule engine")
+    else:
+        print(f"[daemon] Signal gate: RULE ENGINE (deterministic, $0 cost) — set LLM_GATE_ENABLED=1 to re-enable LLM")
     print(f"[daemon] Portfolio: ${balance:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT}% | Max risk: {MAX_PORTFOLIO_RISK_PCT}%")
     print(f"[daemon] Coin list refreshes every {SYMBOL_CACHE_TTL//60}min")
     while True:
