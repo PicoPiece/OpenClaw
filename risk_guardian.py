@@ -158,6 +158,14 @@ def _auto_only_daily_pnl(history: list[dict], today_iso: str) -> float:
 
 
 def evaluate(es: dict, ts: dict) -> dict:
+    # Read max_daily_loss from trading_control.json so the operator can adjust
+    # it without editing risk_guardian.py.  Fallback chain:
+    #   trading_control.json["max_daily_loss"] → DAILY_LOSS_LIMIT constant
+    ctrl = load_json(TRADING_CONTROL, {})
+    dynamic_limit = float(ctrl.get("max_daily_loss") or DAILY_LOSS_LIMIT)
+    action_daily = dynamic_limit * 0.80   # pause at 80% of limit
+    warn_daily   = dynamic_limit * 0.50   # warn  at 50% of limit
+
     history = es.get("trade_history") or []
     today_iso = datetime.now(timezone.utc).date().isoformat()
     # Recompute from history with auto-only filter — supersedes stored counter
@@ -180,16 +188,16 @@ def evaluate(es: dict, ts: dict) -> dict:
     active = sum(1 for s in (ts.get("states") or {}).values() if s.get("state") == "ACTIVE")
 
     actions, warnings = [], []
-    if daily_pnl <= -ACTION_DAILY_LOSS:
-        actions.append(f"Daily loss ${daily_pnl:.2f} >= ${ACTION_DAILY_LOSS} (80% limit)")
+    if daily_pnl <= -action_daily:
+        actions.append(f"Daily loss ${daily_pnl:.2f} >= ${action_daily:.0f} (80% of ${dynamic_limit:.0f} limit)")
     if consec >= ACTION_CONSEC_LOSSES:
         actions.append(f"Consecutive losses {consec} >= {ACTION_CONSEC_LOSSES}")
     if dd_pct > ACTION_DD_PCT:
         actions.append(f"Drawdown {dd_pct:.2f}% > {ACTION_DD_PCT}% (catastrophic)")
 
     if not actions:
-        if daily_pnl <= -WARN_DAILY_LOSS:
-            warnings.append(f"Daily loss ${daily_pnl:.2f} >= ${WARN_DAILY_LOSS} (50% limit)")
+        if daily_pnl <= -warn_daily:
+            warnings.append(f"Daily loss ${daily_pnl:.2f} >= ${warn_daily:.0f} (50% of ${dynamic_limit:.0f} limit)")
         if consec >= WARN_CONSEC_LOSSES:
             warnings.append(f"Consecutive losses {consec} >= {WARN_CONSEC_LOSSES}")
         if active > WARN_ACTIVE_POSITIONS:
