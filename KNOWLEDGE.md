@@ -1,7 +1,7 @@
 # OpenClaw Knowledge Base
 
 **Ground truth for the OpenClaw AI bot. Updated when system changes.**
-Last updated: 2026-05-08
+Last updated: 2026-06-02
 
 ---
 
@@ -43,23 +43,44 @@ Override via env: COIN_ALLOWLIST="aave,eth,..."
 
 ## SECTION:GRID_BOTS
 
-4 Spot Grid bots (active, started ~2026-04 after closing legacy 8 bots):
+Spot Grid bots (started 2026-05-07 after closing legacy 8 bots):
 
-| Symbol | Range | Grids | Invested |
-|---|---|---|---|
-| AAVEUSDT | $82 - $118 | 60 | $450 |
-| DOTUSDT  | $1.10 - $1.50 | 50 | $400 |
-| XRPUSDT  | $1.25 - $1.55 | 40 | $350 |
-| AVAXUSDT | $8.50 - $10.50 | 35 | $300 |
+| Symbol | Range | Grids | Invested | Status |
+|---|---|---|---|---|
+| AAVEUSDT | $82 - $118 | 60 | $450 | **CLOSED 2026-06-02** (stop hit, -$62) |
+| DOTUSDT  | $1.10 - $1.50 | 50 | $400 | active |
+| XRPUSDT  | $1.25 - $1.55 | 40 | $350 | active (below range) |
+| AVAXUSDT | $8.50 - $10.50 | 35 | $300 | active (below range) |
 
-Total invested: $1500. Expected ROI: 1.5-4%/mo realistic (NOT 25%/mo as
+Initial total invested: $1500. Expected ROI: 1.5-4%/mo realistic (NOT 25%/mo as
 initially claimed — that was over-optimistic).
 
 Grid warmup period: 7 days (`self_sustainability.WARMUP_DAYS`). Before that,
 grid P&L is not projected to monthly run-rate (slippage skews it).
 
-Legacy 8 bots (BTC/ETH/BNB) were closed 2026-04 after -$279 loss. Lesson:
-grids only profitable in true sideways markets, not in trending markets.
+### REGIME-GATED GRID DEPLOYMENT (rule, 2026-06-02)
+
+**Grid bots are a SIDEWAYS-market tool only.** Decision to run/deploy a grid
+MUST be gated on BTC regime, NOT on coin selection:
+
+| BTC 7d regime | Grid action |
+|---|---|
+| DOWNTREND (< -5%) | **DO NOT deploy new grids.** Park free capital in Earn. |
+| SIDEWAYS (-5% to +5%) | Grid bots OK — this is their ideal regime. |
+| UPTREND (> +5%) | Grids underperform HODL; prefer HODL/Futures-long. |
+
+Anti-pattern to AVOID: "cut losing grid → rotate into a new grid → it also
+loses → cut again". During a market-wide downtrend ALL coins fall together;
+rotating coins just repeats buy-high-sell-low. The problem is regime, not coin.
+
+Enforcement: `regime_drift_detector.py::check_grid_regime_gate()` runs every 6h,
+writes `grid_gate` block into `data/regime_state.json`, and sends a Telegram
+alert when (a) BTC DOWNTREND while bots are below range, or (b) any bot is
+within 2% of its stop. `deploy_ok=false` means do not open new grids.
+
+Legacy 8 bots (BTC/ETH/BNB) were closed 2026-04 after -$279 loss. AAVE grid
+auto-stopped 2026-06-02 at -$62 during BTC -8% week. Both confirm the same
+lesson: grids only profit in true sideways markets, never in trending markets.
 
 ---
 
@@ -272,6 +293,22 @@ Top lessons (chronological, key learnings from real failures):
     - Trade-off: Accept ~$2-3 expected loss per probe in exchange for data
       that improves future signal quality on these coins.
 
+11. **Grid rotation trap during downtrend (June 2026)**
+    - Symptom: Closed 4 legacy coins → opened 4 grid bots (AAVE/DOT/XRP/AVAX).
+      26 days later BTC dropped -8%/week, 3 of 4 bots fell below range, AAVE
+      auto-stopped at -$62 (-14%). User asked: "we keep cutting losses to
+      rotate, is this OK?"
+    - Cause: Grid bots only profit in SIDEWAYS markets. In a downtrend they
+      keep buying the dip all the way down. Rotating to different coins does
+      NOT help — during a market-wide drawdown all coins fall together (beta).
+      The problem is regime mismatch, not coin selection.
+    - Fix: Regime-gated grid deployment (see SECTION:GRID_BOTS). Added
+      `check_grid_regime_gate()` to `regime_drift_detector.py` — blocks new
+      grid deployment in DOWNTREND and alerts when bots near stop. In
+      downtrend, park capital in Earn and WAIT for sideways regime.
+    - Lesson: Don't fix a regime problem by changing coins. Match the tool to
+      the market: downtrend→cash, sideways→grid, uptrend→HODL/futures-long.
+
 ---
 
 ## SECTION:OPERATIONAL_PLAYBOOK
@@ -349,6 +386,18 @@ A: Default 20x. Higher leverage doesn't improve EV, only amplifies variance.
 
 Q: "Grid bot ROI thực tế?"
 A: 1.5-4%/mo realistic. Initial 25%/mo claim was wrong. See LESSONS #2.
+
+Q: "Grid bot đang lỗ, có nên cắt và mở grid coin khác không?"
+A: KHÔNG nếu BTC đang DOWNTREND. Grid bot chỉ sinh lời khi thị trường SIDEWAY.
+   Trong downtrend mọi coin rớt cùng nhau (beta) — đổi coin chỉ lặp lại
+   "mua cao bán thấp". Vấn đề là REGIME, không phải coin. Giải pháp: dừng
+   grid, để tiền trong Earn, chờ thị trường đi ngang trở lại. Khi đó mới
+   deploy grid. Xem SECTION:GRID_BOTS (regime-gated deployment) + LESSONS #11.
+
+Q: "Khi nào nên deploy grid bot mới?"
+A: Chỉ khi BTC 7d regime = SIDEWAYS (-5% đến +5%). DOWNTREND → để tiền trong
+   Earn. UPTREND → ưu tiên HODL/Futures-long. Check `grid_gate.deploy_ok`
+   trong data/regime_state.json (cập nhật mỗi 6h).
 
 Q: "Hệ thống có biết vào lệnh sau khi giá hồi (pullback)?"
 A: Có — Pullback Re-Entry mode. Khi LLM REJECT một explosive breakout vì RSI

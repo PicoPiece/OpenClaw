@@ -21,7 +21,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "decisions.db"
 STATE_FILE = ROOT / "data" / "regime_state.json"
+GRID_CONFIG = ROOT / "data" / "grid_config.json"
 ENV_FILE = ROOT / ".env"
+
+# Grid regime gate: how close (%) to stop_lower/stop_upper before we warn.
+GRID_NEAR_STOP_PCT = 2.0
 
 # Backtest 90d baseline (V6_COIN_FILTER allowlist 7)
 BASELINE_WR = 45.6
@@ -76,6 +80,104 @@ def get_btc_regime() -> dict:
         return {"regime": "UNKNOWN", "error": str(e)}
 
 
+def check_grid_regime_gate(btc_regime: str) -> dict:
+    """Regime-gated grid deployment check.
+
+    Lesson (2026-06-02): Grid bots only profit in SIDEWAYS markets. In a BTC
+    DOWNTREND they keep buying the dip all the way down and bleed (AAVE bot
+    auto-stopped at -$62 / -14%). Rotating coins does NOT fix this — it just
+    repeats "buy high, sell low". The fix is regime-gating: do NOT run/deploy
+    grid bots while BTC is in a DOWNTREND.
+
+    Returns dict with:
+      - deploy_ok: bool — whether NEW grid deployment is advisable now
+      - bots: list of per-bot status (in_range / below / above / near_stop)
+      - alerts: list of human-readable warnings
+    """
+    result = {"deploy_ok": btc_regime != "DOWNTREND", "bots": [], "alerts": []}
+
+    if not GRID_CONFIG.exists():
+        return result
+
+    try:
+        cfg = json.loads(GRID_CONFIG.read_text())
+    except Exception:
+        return result
+
+    symbols = [s for s in cfg if s.endswith("USDT")]
+    if not symbols:
+        return result
+
+    # Fetch live spot prices
+    prices = {}
+    try:
+        from binance.client import Client
+        c = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+        for sym in symbols:
+            try:
+                t = c.get_symbol_ticker(symbol=sym)
+                prices[sym] = float(t["price"])
+            except Exception:
+                prices[sym] = None
+    except Exception as e:
+        result["alerts"].append(f"GRID_PRICE_FETCH_FAILED: {e}")
+        return result
+
+    below_range = []
+    near_stop = []
+    for sym in symbols:
+        c_cfg = cfg[sym]
+        # Skip bots already marked closed
+        if c_cfg.get("status") == "closed" or c_cfg.get("binance_grid_id") == "CLOSED":
+            continue
+        price = prices.get(sym)
+        if price is None:
+            continue
+        lo = c_cfg.get("lower", 0)
+        hi = c_cfg.get("upper", 0)
+        sl_lo = c_cfg.get("stop_lower", 0)
+        sl_hi = c_cfg.get("stop_upper", 0)
+
+        if sl_lo and price <= sl_lo * (1 + GRID_NEAR_STOP_PCT / 100):
+            status = "NEAR_STOP_LOW"
+            near_stop.append(sym)
+        elif sl_hi and price >= sl_hi * (1 - GRID_NEAR_STOP_PCT / 100):
+            status = "NEAR_STOP_HIGH"
+            near_stop.append(sym)
+        elif lo and price < lo:
+            status = "BELOW_RANGE"
+            below_range.append(sym)
+        elif hi and price > hi:
+            status = "ABOVE_RANGE"
+        else:
+            status = "IN_RANGE"
+
+        result["bots"].append({
+            "symbol": sym, "price": price, "lower": lo, "upper": hi,
+            "stop_lower": sl_lo, "stop_upper": sl_hi, "status": status,
+            "invested_usd": c_cfg.get("invested_usd", 0),
+        })
+
+    if near_stop:
+        result["alerts"].append(
+            f"GRID_NEAR_STOP: {', '.join(near_stop)} within {GRID_NEAR_STOP_PCT}% of stop — "
+            f"review/close manually (downtrend kills grids)"
+        )
+    if btc_regime == "DOWNTREND" and below_range:
+        result["alerts"].append(
+            f"GRID_REGIME_RISK: BTC DOWNTREND + {len(below_range)} bot(s) below range "
+            f"({', '.join(below_range)}). Grids bleed in downtrend — do NOT deploy new "
+            f"grids; consider parking capital in Earn until SIDEWAYS resumes."
+        )
+    elif btc_regime == "DOWNTREND":
+        result["alerts"].append(
+            "GRID_DEPLOY_BLOCKED: BTC DOWNTREND — new grid deployment not advised. "
+            "Park free capital in Earn until regime turns SIDEWAYS/UPTREND."
+        )
+
+    return result
+
+
 def get_live_wr() -> dict:
     """Per-coin + overall WR over rolling 7d from decisions.db."""
     if not DB_PATH.exists():
@@ -125,15 +227,24 @@ def main():
         try: prev_state = json.loads(STATE_FILE.read_text())
         except Exception: prev_state = {}
 
+    grid_gate = check_grid_regime_gate(btc.get("regime", "UNKNOWN"))
+
     state = {
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "btc_regime": btc,
         "live_7d": live,
+        "grid_gate": grid_gate,
         "alerts": [],
     }
 
     if prev_state.get("btc_regime", {}).get("regime") and prev_state["btc_regime"]["regime"] != btc.get("regime"):
         state["alerts"].append(f"REGIME_CHANGE: {prev_state['btc_regime']['regime']} → {btc['regime']} (BTC 7d: {btc['btc_change_pct']:+.2f}%)")
+
+    # Grid regime-gate alerts (deduped against previous run to avoid spam)
+    prev_grid_alerts = set(prev_state.get("grid_gate", {}).get("alerts", []))
+    for ga in grid_gate.get("alerts", []):
+        if ga not in prev_grid_alerts:
+            state["alerts"].append(ga)
 
     if overall and overall["n"] >= 5:
         wr_drop = BASELINE_WR - overall["wr"]
@@ -150,6 +261,9 @@ def main():
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
 
     print(f"[regime] BTC 7d: {btc.get('btc_change_pct',0):+.2f}% → {btc.get('regime')}")
+    print(f"[grid] deploy_ok={grid_gate.get('deploy_ok')} ({len(grid_gate.get('bots',[]))} active bot(s))")
+    for b in grid_gate.get("bots", []):
+        print(f"  {b['symbol']:10} ${b['price']:>10.4f}  [{b['lower']}-{b['upper']}]  {b['status']}")
     if overall:
         print(f"[regime] Live 7d: N={overall['n']} W={overall['w']} L={overall['l']} WR={overall['wr']:.1f}% pnl=${overall['pnl']:+.2f} R={overall['r']:+.2f}")
         print(f"[regime] Per-coin (sample size>=2):")
