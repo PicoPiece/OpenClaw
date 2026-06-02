@@ -510,6 +510,37 @@ PULLBACK_SL_ATR_MULT = float(os.environ.get("PULLBACK_SL_ATR_MULT", "0.5"))     
 PULLBACK_TP_ATR_MULT = float(os.environ.get("PULLBACK_TP_ATR_MULT", "2.5"))         # target = original burst high
 PULLBACK_MAX_VOL_RATIO = float(os.environ.get("PULLBACK_MAX_VOL_RATIO", "2.0"))     # FOMO cooled (vol back to normal-ish)
 
+# === DOWNTREND CONTINUATION SHORT mode (2026-06-02) ===
+# The standard SHORT rules require a volume spike (vol_ratio >= 1.2) and an
+# RSI cross-down from overbought. In a slow, low-volume grind-down (e.g. BTC
+# -10% over a week) neither fires, so the engine MISSES continuation shorts —
+# the textbook "sell the rally into resistance" pattern in an established
+# downtrend. This mode adds a second short path that:
+#   - Requires the 4h trend to already be BEARISH (regime confirmed)
+#   - Enters when price rallies UP to ~EMA20 (1h) then stalls/rolls over
+#   - Relaxes the volume filter (downtrend bleed has low volume by nature)
+#   - Uses RSI 40-65 (selling a bounce, NOT shorting into oversold)
+# Default OFF until backtested. Enable with DOWNTREND_SHORT=1 in .env.
+#
+# BACKTEST 45d/11-coin param sweep (2026-06-02) — see backtest_dt_short.py:
+#   loose (no gap filter, vol>=0.6):  N=392 WR=28% totalR=-62  ← original idea REFUTED
+#   strong-trend (gap filters):       N=59  WR=34% totalR=+1   ← breakeven
+#   strong-trend + vol>=1.2 (C2):     N=22  WR=41% totalR=+5  avgR+0.23  ← BEST
+# Lesson: low-volume grind shorts LOSE. Edge requires a confirmed strong 4h
+# downtrend (EMA gap) AND volume confirmation. The "relax volume" premise was
+# wrong. Defaults below = validated C2 config. Edge is thin + small sample, so
+# flag stays OFF by default until more live data accumulates.
+DOWNTREND_SHORT_ENABLED = os.environ.get("DOWNTREND_SHORT", "0").lower() in ("1", "true", "yes")
+DT_SHORT_RISK_PCT = float(os.environ.get("DT_SHORT_RISK_PCT", "1.5"))               # half-size (counter-bounce risk)
+DT_SHORT_SL_ATR_MULT = float(os.environ.get("DT_SHORT_SL_ATR_MULT", "1.0"))         # SL above EMA20 / recent high
+DT_SHORT_TP_ATR_MULT = float(os.environ.get("DT_SHORT_TP_ATR_MULT", "2.0"))         # R:R 2.0
+DT_SHORT_RSI_MIN = float(os.environ.get("DT_SHORT_RSI_MIN", "40.0"))                # not oversold
+DT_SHORT_RSI_MAX = float(os.environ.get("DT_SHORT_RSI_MAX", "65.0"))                # bounce into resistance, not new high
+DT_SHORT_EMA_PROX_PCT = float(os.environ.get("DT_SHORT_EMA_PROX_PCT", "1.5"))       # price within N% of EMA20 (at resistance)
+DT_SHORT_MIN_VOL_RATIO = float(os.environ.get("DT_SHORT_MIN_VOL_RATIO", "1.2"))     # validated: volume DOES matter
+DT_SHORT_MIN_GAP4_PCT = float(os.environ.get("DT_SHORT_MIN_GAP4_PCT", "1.5"))       # 4h EMA gap — confirms STRONG downtrend
+DT_SHORT_MIN_GAP1_PCT = float(os.environ.get("DT_SHORT_MIN_GAP1_PCT", "1.0"))       # 1h EMA gap — avoid chop
+
 
 # ---------------------------------------------------------------------------
 # Auto-discover top coins by volume
@@ -1232,6 +1263,70 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "status": "pending_review",
             })
+            continue  # standard short fired — don't double-signal this coin
+
+        # --- DOWNTREND CONTINUATION SHORT (sell the rally into resistance) ---
+        # Fires only when the standard short did NOT, the 4h trend is already
+        # BEARISH, and price has rallied back up near EMA20 (resistance) in an
+        # established downtrend. Relaxes the volume filter that blocks shorts
+        # during low-volume grind-downs. Allowlist-only, half size.
+        ema20_4h = ind.get("ema20_4h")
+        ema50_4h = ind.get("ema50_4h")
+        gap4_pct = (
+            (ema50_4h - ema20_4h) / ema50_4h * 100
+            if (ema20_4h and ema50_4h and ema50_4h != 0) else 0
+        )
+        gap1_pct = (ema_slow - ema_fast) / ema_slow * 100 if ema_slow else 0
+        if (
+            DOWNTREND_SHORT_ENABLED
+            and in_allowlist
+            and ema_cross_4h == "BEARISH"        # regime confirmed on 4h
+            and gap4_pct >= DT_SHORT_MIN_GAP4_PCT  # STRONG 4h downtrend (validated)
+            and ema_bearish                       # 1h also bearish
+            and gap1_pct >= DT_SHORT_MIN_GAP1_PCT  # 1h gap — avoid chop (validated)
+            and DT_SHORT_RSI_MIN <= rsi <= DT_SHORT_RSI_MAX  # bounce, not oversold/new-high
+            and vol_ratio >= DT_SHORT_MIN_VOL_RATIO          # volume confirmation (validated)
+        ):
+            # Price must be near EMA20 from below/at it (rally into resistance),
+            # and momentum rolling over (rsi not still rising hard).
+            near_resistance = abs(price - ema_fast) / ema_fast * 100 <= DT_SHORT_EMA_PROX_PCT
+            rolling_over = rsi_delta <= 1.0  # not in a strong up-thrust
+            if near_resistance and rolling_over and price <= ema_slow:
+                entry = round(price, 6)
+                sl = round(entry + DT_SHORT_SL_ATR_MULT * atr, 6)
+                tp = round(entry - DT_SHORT_TP_ATR_MULT * atr, 6)
+                sl_pct = abs(sl - entry) / entry * 100
+                tp_pct = abs(entry - tp) / entry * 100
+                pos = calc_position_size(entry, sl, balance, risk_pct_override=DT_SHORT_RISK_PCT)
+                signals.append({
+                    "coin": coin,
+                    "symbol": symbol,
+                    "direction": "SHORT",
+                    "strength": "MODERATE",
+                    "mode_hint": "DOWNTREND_SHORT",
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": tp,
+                    "sl_pct": round(sl_pct, 2),
+                    "tp_pct": round(tp_pct, 2),
+                    "atr": round(atr, 6),
+                    "rsi": round(rsi, 1),
+                    "rsi_prev": round(rsi_prev, 1),
+                    "rsi_delta": round(rsi_delta, 1),
+                    "ema20": round(ema_fast, 6),
+                    "ema50": round(ema_slow, 6),
+                    "ema_gap_pct": round(ema_gap_pct, 3),
+                    "ema_cross_4h": ema_cross_4h,
+                    "vol_ratio": round(vol_ratio, 2),
+                    "trend": trend,
+                    "rr_ratio": round(DT_SHORT_TP_ATR_MULT / DT_SHORT_SL_ATR_MULT, 2),
+                    "position_usd": pos["position_usd"],
+                    "qty": pos["qty"],
+                    "risk_usd": pos["risk_usd"],
+                    "risk_pct": pos["risk_pct"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "pending_review",
+                })
 
     return signals
 
@@ -2437,6 +2532,12 @@ def daemon_loop():
               f"| SL={PULLBACK_SL_ATR_MULT}xATR | TP={PULLBACK_TP_ATR_MULT}xATR")
     else:
         print(f"[daemon] PULLBACK RE-ENTRY: OFF (set PULLBACK_REENTRY=1 to enable)")
+    if DOWNTREND_SHORT_ENABLED:
+        print(f"[daemon] DOWNTREND CONTINUATION SHORT: ON | risk={DT_SHORT_RISK_PCT}% "
+              f"| SL={DT_SHORT_SL_ATR_MULT}xATR | TP={DT_SHORT_TP_ATR_MULT}xATR "
+              f"| RSI {DT_SHORT_RSI_MIN}-{DT_SHORT_RSI_MAX} | min_vol={DT_SHORT_MIN_VOL_RATIO}x")
+    else:
+        print(f"[daemon] DOWNTREND CONTINUATION SHORT: OFF (set DOWNTREND_SHORT=1 to enable)")
     if LLM_GATE_ENABLED:
         print(f"[daemon] Signal gate: LLM (DeepSeek) — set LLM_GATE_ENABLED=0 to use rule engine")
     else:

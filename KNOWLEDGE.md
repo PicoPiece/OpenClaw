@@ -187,6 +187,27 @@ Pullback Re-Entry mode (added 2026-05-10):
   systematizes that pattern.
 - Each coin can only fire once per watch cycle (fired flag prevents dup).
 
+Downtrend Continuation Short mode (added 2026-06-02, default OFF):
+- Env DOWNTREND_SHORT=1 enables a 2nd short path: "sell the rally into
+  resistance" in an established downtrend. Standard short rules miss this
+  because they need an RSI cross-down from overbought + volume spike, which
+  never fires during a slow grind-down (e.g. BTC -10%/week, low volume).
+- Fire conditions (allowlist-only, half size 1.5%):
+  - 4h EMA cross = BEARISH (regime confirmed)
+  - 4h EMA gap >= 1.5% (DT_SHORT_MIN_GAP4_PCT — STRONG downtrend, not chop)
+  - 1h EMA bearish + 1h gap >= 1.0% (DT_SHORT_MIN_GAP1_PCT)
+  - RSI 40-65 (selling a bounce, NOT shorting into oversold)
+  - vol_ratio >= 1.2 (volume confirmation REQUIRED)
+  - price within 1.5% of EMA20 (at resistance) + RSI rolling over
+  - SL 1.0×ATR, TP 2.0×ATR (R:R 2.0)
+- BACKTEST 45d/11-coin sweep (backtest_dt_short.py): the ORIGINAL premise
+  ("relax volume to catch low-vol grind shorts") was REFUTED — loose config
+  got WR 28% / -62R. Low-volume shorts LOSE. Only a strict config (strong 4h
+  gap + volume>=1.2) was +EV: WR 41% / +5R / +0.23R per trade, but small
+  sample (N=22). Defaults = validated strict config. Flag stays OFF until
+  more live data confirms the thin edge.
+- Lesson: backtest BEFORE enabling. This saved deploying a -62R strategy.
+
 RSI thresholds:
 - RSI_OVERBOUGHT = 70, RSI_OVERSOLD = 30
 - RSI_LONG_MIN = 45 (need momentum for long)
@@ -409,6 +430,14 @@ Q: "Tại sao breakout bị reject mà giá vẫn lên?"
 A: Reject thường vì RSI extreme (>72 LONG) — đó là cảnh báo "đỉnh ngắn hạn".
    Hệ thống không đoán sai trend mà chỉ ngại entry tệ. Pullback Re-Entry mode
    sẽ catch lại nếu giá hồi về vùng support — đây là pattern textbook.
+
+Q: "Tại sao downtrend mạnh mà không có lệnh short?"
+A: Short tiêu chuẩn cần RSI cross xuống từ >70 + volume spike >=1.2x. Trong
+   downtrend "grind chậm" (volume thấp) cả hai không fire → miss. Có
+   DOWNTREND_SHORT mode (mặc định TẮT) để "bán hồi vào kháng cự", NHƯNG
+   backtest cho thấy biên lợi nhuận mỏng (WR 41%, +0.23R, N nhỏ) và short
+   volume thấp THUA nặng. Vì vậy chỉ bật khi có thêm data live xác nhận.
+   Quan trọng: KHÔNG cố short vào vùng oversold (RSI<35) — đó là vùng dễ bật.
 
 ---
 
