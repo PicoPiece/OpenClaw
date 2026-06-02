@@ -314,6 +314,25 @@ Top lessons (chronological, key learnings from real failures):
     - Trade-off: Accept ~$2-3 expected loss per probe in exchange for data
       that improves future signal quality on these coins.
 
+12. **Discretionary strategies don't survive mechanization (June 2026)**
+    - Context: User shared a "Sneaky Pivot" price-action strategy (26yr trader,
+      minimalist: 15m chart, prior-day Range High/Low + Swing levels, 3-candle
+      reject→confirm pattern, "location > signal", sideways mean-reversion).
+    - Tested it: built `backtest_level_reversion.py` (15m, prior-day levels,
+      rejection-wick + confirmation-candle entry, BTC-regime gate). 45d/11-coin.
+    - Result: BREAKEVEN gross (best +0.007R/trade over 405 trades, WR 32.6% ~=
+      RR2 breakeven 33%). After fees it's strongly NEGATIVE: 15m trading =
+      ~0.13R/trade in fees -> gross +3R becomes net ~-50R. The sideways regime
+      gate added NO edge (sideway +2R == all-regimes +2R).
+    - Lesson: the real edge in a discretionary price-action method is the
+      trader's contextual judgment (order flow, structure, experience), NOT the
+      written rules. Mechanizing "trustworthy candle / wick strength" loses the
+      edge. High-frequency mean-reversion (15m) also bleeds fees. Our 1h/4h
+      momentum/trend-following does NOT have this fee problem — patience in
+      sideways (few signals) beats forcing low-edge 15m reversals.
+    - 2nd backtest in one day to PREVENT a losing deploy (after DT_SHORT -62R).
+      Process: quantify -> backtest -> reject if no edge. Keeps capital safe.
+
 11. **Grid rotation trap during downtrend (June 2026)**
     - Symptom: Closed 4 legacy coins → opened 4 grid bots (AAVE/DOT/XRP/AVAX).
       26 days later BTC dropped -8%/week, 3 of 4 bots fell below range, AAVE
@@ -430,6 +449,12 @@ Q: "Tại sao breakout bị reject mà giá vẫn lên?"
 A: Reject thường vì RSI extreme (>72 LONG) — đó là cảnh báo "đỉnh ngắn hạn".
    Hệ thống không đoán sai trend mà chỉ ngại entry tệ. Pullback Re-Entry mode
    sẽ catch lại nếu giá hồi về vùng support — đây là pattern textbook.
+
+Q: "Có nên dùng chiến lược price-action / Sneaky Pivot (level reversion 15m)?"
+A: KHÔNG. Đã backtest (backtest_level_reversion.py): breakeven gross
+   (+0.007R/lệnh), âm nặng sau phí (15m = ~0.13R phí/lệnh → ~-50R net). Regime
+   gate không tạo edge. Edge thật của price-action thủ công nằm ở phán đoán
+   trader, không cơ giới hóa được. Xem LESSONS #12.
 
 Q: "Tại sao downtrend mạnh mà không có lệnh short?"
 A: Short tiêu chuẩn cần RSI cross xuống từ >70 + volume spike >=1.2x. Trong
