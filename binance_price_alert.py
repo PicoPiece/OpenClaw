@@ -476,6 +476,23 @@ BREAKOUT_SL_ATR_MULT = float(os.environ.get("BREAKOUT_SL_ATR_MULT", "0.6"))
 BREAKOUT_TP_ATR_MULT = float(os.environ.get("BREAKOUT_TP_ATR_MULT", "2.0"))
 BREAKOUT_VOL_REGIME_MAX_PCT = float(os.environ.get("BREAKOUT_VOL_REGIME_MAX_PCT", "5.0"))
 
+# === EXPLOSIVE breakout volatility ceiling (2026-06-04) ===
+# BUG FIX: the standard volatility regime cap (2.5% allowlist / 5% off-list)
+# was running BEFORE the explosive-burst path and skipping high-vol coins
+# entirely. This filtered out exactly the explosive moves the burst path
+# exists to catch — e.g. ENA (+33% range, ATR% 7.6%) and WLD (+42%, ATR% 9%)
+# in June 2026 were silently dropped. The explosive path now gets its own,
+# much higher ceiling so 30%-pump coins are reachable. Standard EMA-cross
+# entries keep the low cap (they don't want to chase whipsaw vol).
+EXPLOSIVE_VOL_REGIME_MAX_PCT = float(os.environ.get("EXPLOSIVE_VOL_REGIME_MAX_PCT", "12.0"))
+# Allowlist coins in a CONFIRMED trend (UPTREND/DOWNTREND) get a higher cap than
+# the chop default: high ATR in a directional trend is momentum, not whipsaw
+# noise, and position sizing (ATR-based SL) already scales risk down. This lets
+# the standard trend-following path ride multi-day grind-up pumps (e.g. ENA
+# +33% over 2 days, ATR% 7.6%) that the explosive-burst path misses because
+# they lack a single 3x-volume burst candle. NEUTRAL/chop keeps the tight cap.
+TREND_VOL_REGIME_MAX_PCT = float(os.environ.get("TREND_VOL_REGIME_MAX_PCT", "8.0"))
+
 # === PROBE TRADE mode (2026-05-10) ===
 # For coins with thin/no historical trade data, take small "probe" trades on
 # breakouts to build dataset for RAG memory + decision_logger learning.
@@ -1079,10 +1096,22 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
             continue
 
         # FILTER 2: volatility regime — skip extreme high-vol bars.
-        # For off-allowlist breakout candidates, use the relaxed cap
-        # BREAKOUT_VOL_REGIME_MAX_PCT (default 5%) since high vol IS the signal.
+        # Three-tier cap so the right path stays reachable:
+        #   - EXPLOSIVE burst present  -> EXPLOSIVE_VOL_REGIME_MAX_PCT (12%) so
+        #     30%-pump coins (ENA/WLD) can be ridden by the burst path.
+        #   - off-allowlist candidate  -> BREAKOUT_VOL_REGIME_MAX_PCT (5%)
+        #   - standard allowlist entry -> VOL_REGIME_MAX_PCT (2.5%, noise-safe)
+        # BUG FIX 2026-06-04: previously the standard cap ran first and skipped
+        # high-vol coins before the explosive path could evaluate them.
         atr_pct = atr / price * 100
-        vol_cap = BREAKOUT_VOL_REGIME_MAX_PCT if (not in_allowlist) else VOL_REGIME_MAX_PCT
+        if ind.get("explosive_burst"):
+            vol_cap = EXPLOSIVE_VOL_REGIME_MAX_PCT
+        elif not in_allowlist:
+            vol_cap = BREAKOUT_VOL_REGIME_MAX_PCT
+        elif trend in ("UPTREND", "DOWNTREND"):
+            vol_cap = TREND_VOL_REGIME_MAX_PCT
+        else:
+            vol_cap = VOL_REGIME_MAX_PCT
         if atr_pct > vol_cap:
             continue
 
@@ -2514,7 +2543,9 @@ def daemon_loop():
         print(f"[daemon] Coin allowlist ({len(COIN_ALLOWLIST)}): {sorted(COIN_ALLOWLIST)}")
     else:
         print(f"[daemon] Coin allowlist: DISABLED (all monitored coins eligible)")
-    print(f"[daemon] Volatility regime filter: ATR/price <= {VOL_REGIME_MAX_PCT:.1f}%")
+    print(f"[daemon] Volatility regime filter: chop <= {VOL_REGIME_MAX_PCT:.1f}% | "
+          f"trend <= {TREND_VOL_REGIME_MAX_PCT:.1f}% | off-list <= {BREAKOUT_VOL_REGIME_MAX_PCT:.1f}% | "
+          f"explosive <= {EXPLOSIVE_VOL_REGIME_MAX_PCT:.1f}%")
     if BREAKOUT_OFFLIST_ENABLED:
         print(f"[daemon] BREAKOUT OFF-ALLOWLIST: ON | risk={BREAKOUT_RISK_PCT}% "
               f"| SL={BREAKOUT_SL_ATR_MULT}xATR | TP={BREAKOUT_TP_ATR_MULT}xATR "

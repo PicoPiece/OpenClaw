@@ -142,7 +142,15 @@ Position sizing (`binance_price_alert.py`):
 - MAX_PORTFOLIO_RISK_PCT = 12.0% (allows 4 concurrent positions)
 - Default leverage: 20x
 - MIN_VOLUME_USD = $10M (filters out illiquid coins)
-- VOL_REGIME_MAX_PCT = 2.5% (ATR/price cap)
+- Volatility regime cap (ATR/price) — TIERED (fixed 2026-06-04):
+  - chop / NEUTRAL allowlist: VOL_REGIME_MAX_PCT = 2.5% (noise-safe)
+  - confirmed trend allowlist: TREND_VOL_REGIME_MAX_PCT = 8.0% (directional
+    vol = momentum, ride multi-day grinds; risk capped by ATR position sizing)
+  - off-allowlist breakout: BREAKOUT_VOL_REGIME_MAX_PCT = 5.0%
+  - explosive burst: EXPLOSIVE_VOL_REGIME_MAX_PCT = 12.0%
+  - Was a single 2.5%/5% cap that ran BEFORE the explosive/breakout paths and
+    silently skipped high-vol pumps (ENA +33%, WLD +42% in June 2026). See
+    LESSONS #13.
 
 Breakout Off-Allowlist mode (added 2026-05-10):
 - Env BREAKOUT_OFFLIST=1 enables explosive burst signals on coins NOT in
@@ -313,6 +321,26 @@ Top lessons (chronological, key learnings from real failures):
       breakout off-list (1.5%) after 4 closed trades.
     - Trade-off: Accept ~$2-3 expected loss per probe in exchange for data
       that improves future signal quality on these coins.
+
+13. **Volatility cap blocked the explosive path it was meant to feed (June 2026)**
+    - Symptom: ENA (+33% range, in allowlist) and WLD (+42%, off-allowlist)
+      pumped hard but the engine generated ZERO signals. User: "tại sao window
+      miss ENA, WLD tăng 30%?"
+    - Cause: a single volatility regime filter (FILTER 2: ATR/price <= 2.5%
+      allowlist / 5% off-list) ran BEFORE the explosive-burst and breakout
+      paths and did `continue` on any high-vol coin. ENA ATR% was 7.6%, WLD
+      9.0% — both skipped before any LONG/explosive logic could evaluate them.
+      The filter meant to avoid "extreme bars" was killing exactly the
+      explosive moves the breakout path exists to ride.
+    - Fix: tiered the cap by context — chop 2.5%, confirmed trend 8%, off-list
+      5%, explosive burst 12%. High ATR in a confirmed trend or burst is
+      directional momentum, not noise; ATR-based position sizing already caps
+      risk. Explosive/trend paths are now reachable on 30%-pump coins.
+    - Note: explosive_burst gate still needs a 3x-volume 1.5x-ATR candle, so
+      multi-day grind-up pumps are best caught by the trend tier (standard
+      EMA-cross LONG), not the burst path.
+    - Lesson: filter ORDER matters. A blanket pre-filter can silently starve a
+      specialized path downstream. Check the full pipeline, not just the rule.
 
 12. **Discretionary strategies don't survive mechanization (June 2026)**
     - Context: User shared a "Sneaky Pivot" price-action strategy (26yr trader,
