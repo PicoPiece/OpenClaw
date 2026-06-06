@@ -158,6 +158,11 @@ def check_grid_regime_gate(btc_regime: str) -> dict:
             "invested_usd": c_cfg.get("invested_usd", 0),
         })
 
+    # Only alert when there are active bots to worry about — skip noise when all
+    # grids are closed (user parked capital in Earn; no need for repeat alerts).
+    if not result["bots"]:
+        return result
+
     if near_stop:
         result["alerts"].append(
             f"GRID_NEAR_STOP: {', '.join(near_stop)} within {GRID_NEAR_STOP_PCT}% of stop — "
@@ -168,11 +173,6 @@ def check_grid_regime_gate(btc_regime: str) -> dict:
             f"GRID_REGIME_RISK: BTC DOWNTREND + {len(below_range)} bot(s) below range "
             f"({', '.join(below_range)}). Grids bleed in downtrend — do NOT deploy new "
             f"grids; consider parking capital in Earn until SIDEWAYS resumes."
-        )
-    elif btc_regime == "DOWNTREND":
-        result["alerts"].append(
-            "GRID_DEPLOY_BLOCKED: BTC DOWNTREND — new grid deployment not advised. "
-            "Park free capital in Earn until regime turns SIDEWAYS/UPTREND."
         )
 
     return result

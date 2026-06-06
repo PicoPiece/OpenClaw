@@ -96,6 +96,19 @@ def get_current_price(symbol: str) -> float | None:
         return None
 
 
+def is_bot_active(cfg: dict) -> bool:
+    """True if this grid bot is still running (not manually/auto closed)."""
+    if cfg.get("status") == "closed":
+        return False
+    if cfg.get("binance_grid_id") == "CLOSED":
+        return False
+    return True
+
+
+def active_bots(config: dict) -> dict:
+    return {sym: cfg for sym, cfg in config.items() if is_bot_active(cfg)}
+
+
 def load_config() -> dict:
     """Grid config — user-provided (or auto-populated when grid is setup via API).
 
@@ -172,6 +185,7 @@ def fee_in_usdt(trade: dict) -> float:
 def poll(send_alerts: bool = True) -> dict:
     """Pull new trades for each configured symbol; update state; detect alerts."""
     config = load_config()
+    running = active_bots(config)
     state = load_state()
     fills = state.get("fills_by_symbol", {})
     daily = state.get("daily_pnl", {})
@@ -180,6 +194,9 @@ def poll(send_alerts: bool = True) -> dict:
 
     if not config:
         print("[poll] No grid config yet (data/grid_config.json empty/missing)")
+    elif not running:
+        print("[poll] No active grid bots — skip health alerts")
+        send_alerts = False
 
     for symbol, cfg in config.items():
         sym_state = fills.get(symbol, {"last_trade_id": 0, "trades": []})
@@ -220,8 +237,8 @@ def poll(send_alerts: bool = True) -> dict:
         new_fills_summary[symbol] = len(new_trades)
         print(f"[poll] {symbol}: +{len(new_trades)} new trades (total stored: {len(sym_state['trades'])})")
 
-    # Health checks (current price vs range)
-    for symbol, cfg in config.items():
+    # Health checks (current price vs range) — active bots only
+    for symbol, cfg in running.items():
         cur = get_current_price(symbol)
         if cur is None:
             continue
@@ -258,6 +275,8 @@ def daily_report():
     state = load_state()
     if not config:
         print("[report] No grid config — skip"); return
+    if not active_bots(config):
+        print("[report] No active grid bots — skip daily report"); return
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = state.get("daily_pnl", {})
