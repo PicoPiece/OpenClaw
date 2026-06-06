@@ -386,6 +386,12 @@ Daily routine:
 - 20:00 ICT: grid_daily_report arrives (Python, $0)
 - 21:00 ICT: FinanceBot OpenClaw daily PnL report (Claude via cron)
 
+Grid deploy advisor (`grid_deploy_advisor.py`, timer every 6h):
+- Watches BTC 7d regime; suggests Spot Grid setup when regime = SIDEWAYS
+- Alerts on regime transition INTO SIDEWAYS, or gentle 7-day reminder (no spam)
+- Suggests 1-3 candidates with 14d range/stop/grids — manual deploy on Binance
+- Disabled grid-monitor timers while no bots active; re-enable after deploy
+
 Weekly routine:
 - Sunday 19:00 ICT: weekly_analysis (DeepSeek strategic review, ~$0.05)
 - Sunday 21:00 ICT: LLM weekly review (OpenClaw cron)
