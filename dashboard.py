@@ -33,6 +33,9 @@ PENDING_SIGNAL_FILE = SCRIPT_DIR / "data" / "pending_signal.json"
 SIGNAL_LOG_FILE = SCRIPT_DIR / "data" / "signal_log.json"
 ENV_FILE = SCRIPT_DIR / ".env"
 
+# Dashboard focus: futures only (grid bots closed — hide grid UI noise)
+DASHBOARD_SHOW_GRID = False
+
 BINANCE_FUTURES_PRICE_API = "https://fapi.binance.com/fapi/v1/ticker/price"
 BINANCE_SPOT_PRICE_API = "https://api.binance.com/api/v3/ticker/price"
 
@@ -793,7 +796,7 @@ tr:hover { background: #151d2b; }
 <body>
 <div class="container">
   <header>
-    <h1>PicoTrader</h1>
+    <h1>PicoTrader <span style="font-size:14px; color:#6b7280; font-weight:400;">Futures</span></h1>
     <div>
       <span id="modeBadge" class="status-badge badge-auto">AUTO</span>
       <span id="statusBadge" class="status-badge badge-live">LIVE</span>
@@ -869,7 +872,7 @@ tr:hover { background: #151d2b; }
     <div class="card-sub" id="walletMeta" style="margin-top:8px;"></div>
   </div>
 
-  <div class="card" style="margin-bottom: 16px;">
+  <div class="card" id="gridSection" style="display:none; margin-bottom:16px;">
     <div class="card-title">
       Spot Grid Bots
       <span id="gridApiBadge" style="font-size:10px; padding:2px 6px; border-radius:3px; margin-left:8px;"></span>
@@ -886,9 +889,9 @@ tr:hover { background: #151d2b; }
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
-    <div class="card-title">Trade History</div>
+    <div class="card-title">Futures Trade History</div>
     <table>
-      <thead><tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Close</th><th>P&L</th><th>Result</th></tr></thead>
+      <thead><tr><th>Time</th><th>Coin</th><th>Dir</th><th>Src</th><th>Entry</th><th>Close</th><th>P&L</th><th>Result</th></tr></thead>
       <tbody id="historyTable"></tbody>
     </table>
     <div class="no-data" id="noHistory" style="display:none;">No trades yet — signals are being monitored</div>
@@ -1107,17 +1110,22 @@ function render(d) {
     noHist.style.display = 'block';
   } else {
     noHist.style.display = 'none';
-    hTbody.innerHTML = d.trade_history.map(t => `
+    hTbody.innerHTML = d.trade_history.map(t => {
+      const src = (t.source || 'auto').toLowerCase();
+      const srcLabel = src === 'manual' ? 'MAN' : 'AUTO';
+      const srcStyle = src === 'manual' ? 'color:#f59e0b;' : 'color:#6b7280;';
+      return `
       <tr>
         <td>${t.time ? t.time.slice(0, 16).replace('T', ' ') : '--'}</td>
         <td><span class="coin-tag">${(t.coin || '').toUpperCase()}</span></td>
         <td class="${t.direction === 'LONG' ? 'dir-long' : 'dir-short'}">${t.direction}</td>
+        <td style="${srcStyle} font-size:11px;">${srcLabel}</td>
         <td>${fmt(t.entry || 0)}</td>
         <td>${fmt(t.close || 0)}</td>
         <td class="${pnlClass(t.pnl)}">$${t.pnl >= 0 ? '+' : ''}${(t.pnl || 0).toFixed(2)}</td>
         <td><span class="${t.result === 'TP_HIT' ? 'tp-hit' : 'sl-hit'}">${t.result}</span></td>
-      </tr>
-    `).join('');
+      </tr>`;
+    }).join('');
   }
 
   document.getElementById('timer').textContent = 'Updated ' + new Date().toLocaleTimeString();
@@ -1329,12 +1337,15 @@ function renderWallet(d) {
     const cls = v >= 0 ? 'positive' : 'negative';
     return '<span class="' + cls + '">' + (v >= 0 ? '+' : '') + '$' + v.toFixed(2) + '</span>';
   };
+  const HIDE_WALLETS = ['Trading Bots'];
   const tbody = document.getElementById('walletTable');
-  tbody.innerHTML = d.wallets.filter(w => w.balance > 0.01 || Math.abs(w.delta_24h) > 0.01).map(w => {
-    const isBots = w.name === 'Trading Bots';
-    const highlight = isBots ? 'background:#0a1a2e;' : '';
+  tbody.innerHTML = d.wallets
+    .filter(w => !HIDE_WALLETS.includes(w.name))
+    .filter(w => w.balance > 0.01 || Math.abs(w.delta_24h) > 0.01).map(w => {
+    const isFutures = (w.name || '').includes('Futures');
+    const highlight = isFutures ? 'background:#0a1a2e;' : '';
     return `<tr style="${highlight}">
-      <td>${w.icon} ${w.name}${isBots ? ' <span style="font-size:10px; color:#3b82f6;">[grid bots]</span>' : ''}</td>
+      <td>${w.icon} ${w.name}${isFutures ? ' <span style="font-size:10px; color:#10b981;">[futures]</span>' : ''}</td>
       <td><strong>$${w.balance.toFixed(2)}</strong></td>
       <td>${fmtDelta(w.delta_24h)}</td>
       <td>${fmtDelta(w.delta_7d)}</td>
@@ -1386,9 +1397,8 @@ function renderAsi(d) {
   const pb = d.profit_breakdown;
   document.getElementById('asiProfitTable').innerHTML = `
     <tr><td>Futures (OpenClaw)</td><td style="text-align:right; color:${pb.futures>=0?'#10b981':'#ef4444'};">$${pb.futures.toFixed(2)}</td></tr>
-    <tr><td>Grid (Trading Bots)</td><td style="text-align:right; color:${pb.grid>=0?'#10b981':'#ef4444'};">$${pb.grid.toFixed(2)}</td></tr>
     <tr><td>Earn (Simple Earn)</td><td style="text-align:right; color:#10b981;">$${pb.earn.toFixed(4)}</td></tr>
-    <tr style="border-top:1px solid #374151; font-weight:600;"><td>Total</td><td style="text-align:right; color:#10b981;">$${d.profit_monthly.toFixed(2)}</td></tr>
+    <tr style="border-top:1px solid #374151; font-weight:600;"><td>Total</td><td style="text-align:right; color:#10b981;">$${(pb.futures + pb.earn).toFixed(2)}</td></tr>
   `;
   const cb = d.cost_breakdown;
   document.getElementById('asiCostTable').innerHTML = `
@@ -1399,23 +1409,11 @@ function renderAsi(d) {
   `;
 
   const f = d.details.futures;
-  const g = d.details.grid;
   const c = d.details.cost.deepseek;
-  let gridLine = '';
-  if (g.method === 'config_anchor') {
-    const warmup = g.warmup_status && g.warmup_status !== 'active' ? ` · <span style="color:#f59e0b;">${g.warmup_status}</span>` : '';
-    const dDisp = g.days_float ?? g.days_active;
-    gridLine = `Grid: invested $${g.invested_usd} → now $${g.current_bots_balance} (unrealized ${g.unrealized_pnl>=0?'+':''}$${g.unrealized_pnl}, ${dDisp}d, ${g.bot_count} bots)${warmup}`;
-  } else if (g.method === '24h_delta') {
-    gridLine = `Grid: 24h delta ${g.delta_24h>=0?'+':''}$${g.delta_24h} · balance $${g.current_bots_balance}`;
-  } else {
-    gridLine = `Grid: ${g.note} · balance $${g.current_bots_balance}`;
-  }
   document.getElementById('asiMeta').innerHTML = `
     Futures: ${f.days}d tracking · total ${f.total_pnl>=0?'+':''}$${f.total_pnl} · since ${f.tracking_since}<br/>
-    ${gridLine}<br/>
     DeepSeek: $${c.cumulative_usd} cumulative over ${c.tracking_days}d · balance $${c.balance_remaining} · daily $${c.daily_usd}<br/>
-    <em>Target: ASI ≥ 2.0 = self-sustaining + reinvest. Current cost $${d.cost_monthly}/mo to fund AI infra.</em>
+    <em>Target: ASI ≥ 2.0 = self-sustaining + reinvest. Grid bots hidden (closed). Current cost $${d.cost_monthly}/mo.</em>
   `;
 }
 
@@ -1428,12 +1426,10 @@ function updateAsi() {
 
 update();
 updateLlm();
-updateGrids();
 updateWallet();
 updateAsi();
 setInterval(update, 10000);
 setInterval(updateLlm, 30000);
-setInterval(updateGrids, 15000);
 setInterval(updateWallet, 60000);
 setInterval(updateAsi, 60000);
 </script>
