@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    cfg = load_json(CONFIG_FILE)
+    cfg = load_config()
     mid = cfg.get("active_milestone_id", "M1")
     ms = next((m for m in cfg.get("milestones", []) if m.get("id") == mid), None)
     if not ms:
