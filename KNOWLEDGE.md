@@ -322,6 +322,66 @@ Top lessons (chronological, key learnings from real failures):
     - Trade-off: Accept ~$2-3 expected loss per probe in exchange for data
       that improves future signal quality on these coins.
 
+15. **MTF burst: large TF filter, small TF action (June 2026)**
+    - User request: faster entry without hyper-trading; combo 5m/15m/1h/4h.
+    - Backtest `backtest_mtf_burst.py` 45d / 15 coins (futures, SL 0.6×ATR TP 2×ATR):
+      | Config | N | totalR | avgR |
+      |--------|---|--------|------|
+      | 1H only | 282 | -45R | -0.16 |
+      | 15M solo | 2543 | -230R | -0.09 |
+      | 15M+1H+4H | 1254 | -161R | -0.13 |
+      | 5M+4H | 5216 | +16R | +0.003 |
+      | 5M+15M+4H | 4079 | +783R | +0.19 |
+      | 5M+15M+1H+4H | 3401 | +844R | +0.25 |
+      | H aggressive | 3963 | +1000R | +0.25 |
+    - Key insight: **15M confirm on 5M action** is the edge filter (F beats E by
+      +767R). 15M alone is noise even with 4H filter. 1H burst too slow.
+    - Range-ATR sweep (same MTF stack, 45d): 0.9→+1000R | 0.8→+986R (worse!) |
+      0.7→+1028R | **0.7+vol1.6→+1292R** (best avgR 0.281, WR 31.5%). Looser range
+      alone ≠ better; 0.8 was the worst step. Winner: range 0.7 + vol 1.6.
+    - Deployed live: `ULTRA_BURST_RANGE_ATR=0.7`, `ULTRA_BURST_VOL_RATIO=1.6`,
+      `MTF_CONFIRM_15M=1`, `MTF_BURST_FILTER_1H=1`, `BREAKOUT_LATE_RSI=82`, poll 30s.
+    - Caveat: backtest R is gross (no slippage, all signals taken); live has probe
+      cap 1/day, 1 signal/cycle, fees — expect fewer trades and lower R than sim.
+
+16. **Trade-class router: SCALP + TREND + PULLBACK beats all-scalp (June 2026)**
+    - User request: deploy classes 1/2/3 after 60d backtest showed clear USD PnL edge.
+    - Backtest `backtest_trade_class.py` 60d / $300 wallet / 15 coins:
+      | Strategy | Net USD | PF | MaxDD |
+      |----------|---------|-----|-------|
+      | A all-scalp | +$2,584 | 1.27 | $277 |
+      | B router 2-class | +$5,438 | 1.40 | $475 |
+    - Router split: TREND +$2,801 (627t), SCALP +$2,637 (1610t) — both +EV.
+    - Classes deployed live (rule-based, no LLM):
+      1. **SCALP_BURST** — 5m MTF entry, SL/TP on 5m ATR, timeout 3h, cap 2/day/coin
+      2. **TREND_BREAKOUT** — 5m MTF + 4h/1h trend align + vol≥2.5, SL 5m / TP 1h ATR,
+         timeout 6h, cap 1/day/coin
+      3. **PULLBACK_REENTRY** — late RSI chase (≥82) defers to 90m pullback watch
+    - Filters: bounce-trap skip on weak vol, 4h SL cooldown 4h, daily class caps.
+    - Env: `TRADE_CLASS_ROUTER=1`, `TREND_CLASS_VOL_MIN=2.5`, `SCALP_CLASS_MAX_PER_DAY=2`,
+      `TREND_CLASS_MAX_PER_DAY=1`.
+    - Caveat: router raises max DD in sim ($277→$475); live has fewer trades + fees.
+
+14. **Late breakout entry ≠ edge — ALLO probe win was luck (June 2026)**
+    - Symptom: ALLO LONG BREAKOUT_PROBE hit TP +$15, but entry was risky —
+      RSI 86.9, entered after a +100% multi-day pump, signal at 10:44 UTC on
+      the 09:00 1h candle that already moved +18%.
+    - Cause: bottleneck is **1h kline resolution**, not the 60s poll interval.
+      Explosive burst on the *forming* 1h bar confirms volume/range late in
+      the hour; by then RSI is extreme and entry = market chase at live price.
+      TP/SL from 4h ATR were directionally OK (+18% TP hit) but SL ~4.9% was
+      wide for a late chase — win was luck, not repeatable edge.
+    - Fix (deployed 2026-06-08):
+      1. **FAST_BURST path** — scan last *closed* 15m bar (range≥1.2×ATR,
+         vol≥2.5×); max ~15min detection lag vs ~60min on 1h.
+      2. **Late-chase gate** — if RSI≥75 (LONG) or ≤25 (SHORT) when burst
+         fires, **defer to pullback watch** instead of immediate market entry.
+      3. **15m ATR sizing** on fast path — tighter SL/TP proportional to
+         earlier entry; 1h/4h EMA-cross path unchanged (no hyper-trading).
+    - Lesson: reducing CHECK_INTERVAL alone barely helps when indicators are
+      1h-based. Fix resolution + entry quality, not poll frequency. A winning
+      trade at RSI 87 is a warning, not validation of the strategy.
+
 13. **Volatility cap blocked the explosive path it was meant to feed (June 2026)**
     - Symptom: ENA (+33% range, in allowlist) and WLD (+42%, off-allowlist)
       pumped hard but the engine generated ZERO signals. User: "tại sao window

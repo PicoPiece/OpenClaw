@@ -193,6 +193,119 @@ def _probes_today_for_coin(coin: str) -> int:
         return 0
 
 
+def _load_class_daily() -> dict:
+    if not TRADE_CLASS_DAILY_FILE.exists():
+        return {"date": "", "counts": {}}
+    try:
+        return json.loads(TRADE_CLASS_DAILY_FILE.read_text())
+    except Exception:
+        return {"date": "", "counts": {}}
+
+
+def _save_class_daily(state: dict) -> None:
+    TRADE_CLASS_DAILY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TRADE_CLASS_DAILY_FILE.write_text(json.dumps(state, indent=2))
+
+
+def _class_daily_count(coin: str, trade_class: str) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state = _load_class_daily()
+    if state.get("date") != today:
+        state = {"date": today, "counts": {}}
+    key = f"{coin.lower()}:{trade_class}"
+    return int(state.get("counts", {}).get(key, 0))
+
+
+def _bump_class_daily(coin: str, trade_class: str) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state = _load_class_daily()
+    if state.get("date") != today:
+        state = {"date": today, "counts": {}}
+    key = f"{coin.lower()}:{trade_class}"
+    state.setdefault("counts", {})[key] = state.get("counts", {}).get(key, 0) + 1
+    _save_class_daily(state)
+
+
+def _sl_cooldown_active(coin: str) -> bool:
+    """Block new entries if coin hit SL within CLASS_SL_COOLDOWN_H."""
+    try:
+        es_path = SCRIPT_DIR / "data" / "executor_state.json"
+        if not es_path.exists():
+            return False
+        es = json.loads(es_path.read_text())
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=CLASS_SL_COOLDOWN_H)
+        for t in reversed(es.get("trade_history", [])):
+            if (t.get("coin") or "").lower() != coin.lower():
+                continue
+            if t.get("result") != "SL_HIT":
+                continue
+            try:
+                tt = datetime.fromisoformat((t.get("time") or "").replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if tt >= cutoff:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def classify_burst_trade_class(
+    *,
+    burst_dir: str,
+    price: float,
+    burst_vol: float,
+    rsi: float,
+    trend: str,
+    ema_cross_4h: str,
+    in_allowlist: bool,
+    ind: dict,
+) -> str | None:
+    """Rule router: SCALP_BURST | TREND_BREAKOUT | None (skip)."""
+    bull4 = ema_cross_4h == "BULLISH"
+    bear4 = ema_cross_4h == "BEARISH"
+
+    if burst_dir == "SHORT" and burst_vol < TREND_CLASS_VOL_MIN:
+        ref_low = ind.get("low_24h") or price
+        if ref_low and price > ref_low * (1 + CLASS_BOUNCE_PCT / 100):
+            return None
+    if burst_dir == "LONG" and burst_vol < TREND_CLASS_VOL_MIN:
+        ref_high = ind.get("high_24h") or price
+        if ref_high and price < ref_high * (1 - CLASS_BOUNCE_PCT / 100):
+            return None
+
+    trend_aligned = (
+        (burst_dir == "LONG" and trend == "UPTREND" and bull4) or
+        (burst_dir == "SHORT" and trend == "DOWNTREND" and bear4)
+    )
+    rsi_ok = (
+        (burst_dir == "LONG" and rsi < 75) or
+        (burst_dir == "SHORT" and rsi > 25)
+    )
+    strong_vol = burst_vol >= TREND_CLASS_VOL_MIN
+    quality = in_allowlist or burst_vol >= 3.0
+
+    if trend_aligned and rsi_ok and strong_vol and quality:
+        return "TREND_BREAKOUT"
+    if burst_vol >= min(ULTRA_BURST_VOL_RATIO, FAST_BURST_VOL_RATIO):
+        return "SCALP_BURST"
+    return None
+
+
+def _class_sizing_atrs(trade_class: str, ind: dict, burst_source: str) -> tuple[float, float]:
+    """Return (atr_sl, atr_tp) for trade class."""
+    atr_5m = ind.get("atr_5m") or ind.get("atr_15m") or ind.get("atr_1h") or ind.get("atr")
+    atr_15m = ind.get("atr_15m") or atr_5m
+    atr_1h = ind.get("atr_1h") or ind.get("atr") or atr_15m
+    if trade_class == "TREND_BREAKOUT":
+        return float(atr_5m or 0), float(atr_1h or atr_5m or 0)
+    # SCALP_BURST: 5m/15m symmetric
+    if burst_source in ("ULTRA_5M", "FAST_15M"):
+        base = atr_5m if burst_source == "ULTRA_5M" else atr_15m
+        return float(base or 0), float(base or 0)
+    return float(atr_1h or 0), float(atr_1h or 0)
+
+
 def classify_coin_for_breakout(coin: str, in_allowlist: bool) -> dict:
     """Return classification + trading params for a breakout signal on this coin.
 
@@ -276,21 +389,24 @@ def _purge_expired_watch(state: dict) -> dict:
     return keep
 
 
-def register_pullback_watch(signal: dict, llm_reason: str):
+def register_pullback_watch(signal: dict, llm_reason: str, *, late_chase: bool = False):
     """Add a rejected breakout signal to the pullback watch list.
 
-    Only registers if the rejection reason mentions RSI extreme/exhaustion AND
-    the original signal had explosive_burst (we want pullback re-entries on
-    real momentum events, not generic rejects).
+    Registers when:
+      - late_chase=True (RSI late-entry gate deferred the breakout), OR
+      - rejection reason mentions RSI extreme/exhaustion (legacy LLM path)
+
+    Only on EXPLOSIVE strength — pullback re-entries on real momentum events.
     """
     if not PULLBACK_REENTRY_ENABLED:
         return
     if signal.get("strength") != "EXPLOSIVE":
         return
-    reason_lower = (llm_reason or "").lower()
-    rsi_keywords = ("rsi", "extreme", "exhaustion", "overbought", "oversold")
-    if not any(k in reason_lower for k in rsi_keywords):
-        return
+    if not late_chase:
+        reason_lower = (llm_reason or "").lower()
+        rsi_keywords = ("rsi", "extreme", "exhaustion", "overbought", "oversold")
+        if not any(k in reason_lower for k in rsi_keywords):
+            return
 
     state = _load_pullback_watch()
     state = _purge_expired_watch(state)
@@ -407,13 +523,15 @@ def check_pullback_entries(prices: dict, indicators: dict, balance: float) -> li
         signal = {
             "coin": entry["coin"], "symbol": sym, "direction": direction,
             "strength": "PULLBACK", "mode_hint": "PULLBACK_REENTRY",
+            "trade_class": "PULLBACK_REENTRY",
             "tier": tier_info["tier"],
             "tier_reason": tier_info["reason"],
             "in_allowlist": in_allowlist,
             "entry": entry_p, "sl": sl_p, "tp": tp_p,
             "sl_pct": round(abs(entry_p - sl_p) / entry_p * 100, 3),
             "tp_pct": round(abs(tp_p - entry_p) / entry_p * 100, 3),
-            "atr": round(atr_now, 8), "rsi": round(rsi_now, 1),
+            "atr": round(atr_now, 8), "atr_sl": round(atr_now, 8),
+            "atr_tp": round(atr_now, 8), "rsi": round(rsi_now, 1),
             "rsi_prev": round(ind.get("rsi_prev", rsi_now), 1),
             "rsi_delta": round(rsi_now - ind.get("rsi_prev", rsi_now), 1),
             "ema20": round(ind.get("ema20", 0), 8),
@@ -485,6 +603,46 @@ BREAKOUT_VOL_REGIME_MAX_PCT = float(os.environ.get("BREAKOUT_VOL_REGIME_MAX_PCT"
 # much higher ceiling so 30%-pump coins are reachable. Standard EMA-cross
 # entries keep the low cap (they don't want to chase whipsaw vol).
 EXPLOSIVE_VOL_REGIME_MAX_PCT = float(os.environ.get("EXPLOSIVE_VOL_REGIME_MAX_PCT", "12.0"))
+
+# === FAST BURST path — 15m detection (2026-06-08) ===
+# Lesson from ALLO (+$15 TP but RSI 87 entry = late chase / luck):
+#   - 60s poll interval is NOT the bottleneck; 1h kline resolution is (~60min lag).
+#   - Explosive burst on 1h fires after the big move candle; entry ends up chasing.
+# Fast path: scan last CLOSED 15m bar for burst (max ~15min detection lag).
+# Standard EMA-cross stays on 1h/4h — no hyper-trading.
+FAST_BURST_ENABLED = os.environ.get("FAST_BURST", "1").lower() in ("1", "true", "yes")
+FAST_BURST_INTERVAL = "15m"
+FAST_BURST_RANGE_ATR = float(os.environ.get("FAST_BURST_RANGE_ATR", "1.2"))   # vs 1.5 on 1h
+FAST_BURST_VOL_RATIO = float(os.environ.get("FAST_BURST_VOL_RATIO", "2.5"))   # vs 3.0 on 1h
+
+# Late-chase gate: if RSI already extreme when burst fires, defer to pullback watch
+# instead of market entry (ALLO RSI 86 → probe win was luck, not edge).
+BREAKOUT_LATE_RSI = float(os.environ.get("BREAKOUT_LATE_RSI", "82.0"))
+
+# === ULTRA BURST path — 5m action + MTF filters (2026-06-08) ===
+# Backtest 45d: 5M+15M+1H+4H beat 15M-only (-161R) and 1H-only (-45R).
+# Large TF filters noise; small TF triggers action.
+ULTRA_BURST_ENABLED = os.environ.get("ULTRA_BURST", "1").lower() in ("1", "true", "yes")
+ULTRA_BURST_INTERVAL = "5m"
+ULTRA_BURST_RANGE_ATR = float(os.environ.get("ULTRA_BURST_RANGE_ATR", "0.7"))
+ULTRA_BURST_VOL_RATIO = float(os.environ.get("ULTRA_BURST_VOL_RATIO", "1.6"))
+MTF_CONFIRM_15M = os.environ.get("MTF_CONFIRM_15M", "1").lower() in ("1", "true", "yes")
+MTF_BURST_FILTER_1H = os.environ.get("MTF_BURST_FILTER_1H", "1").lower() in ("1", "true", "yes")
+
+# === Trade-class router (2026-06-08) — SCALP_BURST | TREND_BREAKOUT | PULLBACK_REENTRY ===
+# Backtest 60d: router +$5,438 vs all-scalp +$2,584 (PF 1.40 vs 1.27). Rule-based only.
+TRADE_CLASS_ROUTER = os.environ.get("TRADE_CLASS_ROUTER", "1").lower() in ("1", "true", "yes")
+TREND_CLASS_VOL_MIN = float(os.environ.get("TREND_CLASS_VOL_MIN", "2.5"))
+CLASS_BOUNCE_PCT = float(os.environ.get("CLASS_BOUNCE_PCT", "2.0"))
+CLASS_SL_COOLDOWN_H = float(os.environ.get("CLASS_SL_COOLDOWN_H", "4.0"))
+SCALP_CLASS_MAX_PER_DAY = int(os.environ.get("SCALP_CLASS_MAX_PER_DAY", "2"))
+TREND_CLASS_MAX_PER_DAY = int(os.environ.get("TREND_CLASS_MAX_PER_DAY", "1"))
+TRADE_CLASS_DAILY_FILE = SCRIPT_DIR / "data" / "trade_class_daily.json"
+_CLASS_MODE_PARAMS = {
+    "SCALP_BURST":      {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h": 3.0},
+    "TREND_BREAKOUT":   {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h": 6.0},
+    "PULLBACK_REENTRY": {"sl_mult": 0.5, "tp_mult": 2.5, "timeout_h": 4.0},
+}
 # Allowlist coins in a CONFIRMED trend (UPTREND/DOWNTREND) get a higher cap than
 # the chop default: high ATR in a directional trend is momentum, not whipsaw
 # noise, and position sizing (ATR-based SL) already scales risk down. This lets
@@ -731,6 +889,36 @@ def calc_dynamic_levels(symbol: str) -> dict:
     return {"breakout": breakout, "breakdown": breakdown, "high_7d": high_7d, "low_7d": low_7d}
 
 
+def _burst_closed_bar(raw: list, volumes: list, atr: float,
+                      range_min: float, vol_min: float) -> tuple[bool, str | None, float, float]:
+    """Detect burst on last CLOSED bar (index -2). Returns (fired, direction, range_atr, vol_ratio)."""
+    if len(raw) < 22 or not atr:
+        return False, None, 0.0, 0.0
+    bar = raw[-2]
+    h = float(bar[2])
+    l = float(bar[3])
+    o = float(bar[1])
+    c = float(bar[4])
+    vol = float(bar[5])
+    avg_vol = sum(volumes[-22:-2]) / 20
+    range_atr = (h - l) / atr
+    vol_ratio = (vol / avg_vol) if avg_vol > 0 else 0.0
+    if range_atr >= range_min and vol_ratio >= vol_min:
+        direction = "LONG" if c > o else "SHORT"
+        return True, direction, range_atr, vol_ratio
+    return False, None, range_atr, vol_ratio
+
+
+def _fetch_interval_bars(symbol: str, interval: str, limit: int = 30) -> list | None:
+    try:
+        url = f"{BINANCE_KLINES_API}?symbol={symbol}&interval={interval}&limit={limit}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PicoAlerts/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
 def fetch_klines(symbol: str) -> dict:
     url = f"{BINANCE_KLINES_API}?symbol={symbol}&interval={KLINES_INTERVAL}&limit={KLINES_LIMIT}"
     req = urllib.request.Request(url, headers={"User-Agent": "PicoAlerts/1.0"})
@@ -801,6 +989,47 @@ def fetch_klines(symbol: str) -> dict:
             explosive_burst = True
             burst_direction = "LONG" if last_close > last_open else "SHORT"
 
+    # Fast burst: last CLOSED 15m bar (~15min lag vs ~60min on 1h)
+    fast_burst = False
+    fast_burst_direction = None
+    fast_burst_range_atr = 0.0
+    fast_burst_vol_ratio = 0.0
+    confirm_15m_direction = None
+    atr_15m = atr_1h
+    raw15 = _fetch_interval_bars(symbol, FAST_BURST_INTERVAL) if FAST_BURST_ENABLED else None
+    if raw15:
+        h15 = [float(k[2]) for k in raw15]
+        l15 = [float(k[3]) for k in raw15]
+        c15 = [float(k[4]) for k in raw15]
+        v15 = [float(k[5]) for k in raw15]
+        o15 = [float(k[1]) for k in raw15]
+        atr_15m = calc_atr(h15, l15, c15, ATR_PERIOD) or atr_1h
+        if len(raw15) >= 2:
+            confirm_15m_direction = "LONG" if c15[-2] > o15[-2] else "SHORT"
+        if FAST_BURST_ENABLED and atr_15m:
+            fast_burst, fast_burst_direction, fast_burst_range_atr, fast_burst_vol_ratio = (
+                _burst_closed_bar(raw15, v15, atr_15m, FAST_BURST_RANGE_ATR, FAST_BURST_VOL_RATIO)
+            )
+
+    # Ultra burst: last CLOSED 5m bar — earliest action layer (MTF filters in generate_signals)
+    ultra_burst = False
+    ultra_burst_direction = None
+    ultra_burst_range_atr = 0.0
+    ultra_burst_vol_ratio = 0.0
+    atr_5m = atr_15m
+    if ULTRA_BURST_ENABLED:
+        raw5 = _fetch_interval_bars(symbol, ULTRA_BURST_INTERVAL, limit=40)
+        if raw5:
+            h5 = [float(k[2]) for k in raw5]
+            l5 = [float(k[3]) for k in raw5]
+            c5 = [float(k[4]) for k in raw5]
+            v5 = [float(k[5]) for k in raw5]
+            atr_5m = calc_atr(h5, l5, c5, ATR_PERIOD) or atr_15m
+            if atr_5m:
+                ultra_burst, ultra_burst_direction, ultra_burst_range_atr, ultra_burst_vol_ratio = (
+                    _burst_closed_bar(raw5, v5, atr_5m, ULTRA_BURST_RANGE_ATR, ULTRA_BURST_VOL_RATIO)
+                )
+
     return {
         "price": price,
         "rsi": rsi_now,
@@ -827,6 +1056,19 @@ def fetch_klines(symbol: str) -> dict:
         "burst_direction": burst_direction,
         "last_bar_range_atr": round(last_bar_range_atr, 2),
         "last_bar_vol_ratio": round(last_bar_vol_ratio, 2),
+        # Fast burst (15m closed bar)
+        "fast_burst": fast_burst,
+        "fast_burst_direction": fast_burst_direction,
+        "fast_burst_range_atr": round(fast_burst_range_atr, 2),
+        "fast_burst_vol_ratio": round(fast_burst_vol_ratio, 2),
+        "atr_15m": atr_15m,
+        "confirm_15m_direction": confirm_15m_direction,
+        # Ultra burst (5m closed bar)
+        "ultra_burst": ultra_burst,
+        "ultra_burst_direction": ultra_burst_direction,
+        "ultra_burst_range_atr": round(ultra_burst_range_atr, 2),
+        "ultra_burst_vol_ratio": round(ultra_burst_vol_ratio, 2),
+        "atr_5m": atr_5m,
     }
 
 
@@ -1104,7 +1346,11 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         # BUG FIX 2026-06-04: previously the standard cap ran first and skipped
         # high-vol coins before the explosive path could evaluate them.
         atr_pct = atr / price * 100
-        if ind.get("explosive_burst"):
+        use_ultra_burst = ind.get("ultra_burst") and ULTRA_BURST_ENABLED
+        use_fast_burst = (ind.get("fast_burst") and FAST_BURST_ENABLED
+                          and not use_ultra_burst)
+        has_burst = use_ultra_burst or use_fast_burst or ind.get("explosive_burst")
+        if has_burst:
             vol_cap = EXPLOSIVE_VOL_REGIME_MAX_PCT
         elif not in_allowlist:
             vol_cap = BREAKOUT_VOL_REGIME_MAX_PCT
@@ -1119,67 +1365,147 @@ def generate_signals(prices: dict, indicators: dict, trading_state: dict,
         vol_ok = vol_ratio >= VOLUME_CONFIRM_RATIO
         ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100 if ema_slow else 0
 
-        # Gap 4: Explosive breakout entry path (parallel to standard EMA-cross detection)
-        # Triggers ngay khi 1h candle range > 1.5 ATR + volume > 3x avg + 4h aligned.
-        # Coins are classified by allowlist membership + historical trade count
-        # (PROBE for untested/thin-history off-list coins; OFFLIST_ESTABLISHED
-        # for off-list coins with ≥PROBE_GRADUATION_TRADES; ALLOWLIST otherwise).
-        if ind.get("explosive_burst"):
-            burst_dir = ind.get("burst_direction")
-            mtf_aligned = (
+        # Gap 4: Explosive breakout — MTF combo (5m action / 15m+1h+4h filter).
+        # Priority: ULTRA_5M > FAST_15M > 1H fallback.
+        if has_burst:
+            if use_ultra_burst:
+                burst_dir = ind.get("ultra_burst_direction")
+                burst_source = "ULTRA_5M"
+                sizing_atr = ind.get("atr_5m") or ind.get("atr_15m") or atr
+                burst_range_atr = ind.get("ultra_burst_range_atr")
+                burst_vol_ratio = ind.get("ultra_burst_vol_ratio")
+            elif use_fast_burst:
+                burst_dir = ind.get("fast_burst_direction")
+                burst_source = "FAST_15M"
+                sizing_atr = ind.get("atr_15m") or atr
+                burst_range_atr = ind.get("fast_burst_range_atr")
+                burst_vol_ratio = ind.get("fast_burst_vol_ratio")
+            else:
+                burst_dir = ind.get("burst_direction")
+                burst_source = "1H"
+                sizing_atr = atr
+                burst_range_atr = ind.get("last_bar_range_atr")
+                burst_vol_ratio = ind.get("last_bar_vol_ratio")
+
+            if not burst_dir:
+                continue
+
+            mtf_4h_ok = (
                 (burst_dir == "LONG" and ema_cross_4h in ("BULLISH", "UNKNOWN")) or
                 (burst_dir == "SHORT" and ema_cross_4h in ("BEARISH", "UNKNOWN"))
             )
-            if mtf_aligned:
-                tier_info = classify_coin_for_breakout(coin, in_allowlist)
+            if not mtf_4h_ok:
+                continue
 
-                # PROBE rate-limit: skip if exceeded daily cap for this coin
+            if MTF_BURST_FILTER_1H:
+                if burst_dir == "LONG" and trend == "DOWNTREND":
+                    continue
+                if burst_dir == "SHORT" and trend == "UPTREND":
+                    continue
+
+            if use_ultra_burst and MTF_CONFIRM_15M:
+                c15_dir = ind.get("confirm_15m_direction")
+                if c15_dir and c15_dir != burst_dir:
+                    continue
+
+            tier_info = classify_coin_for_breakout(coin, in_allowlist)
+            burst_vol_live = burst_vol_ratio or ind.get("last_bar_vol_ratio") or 0
+
+            # Late-chase gate → class 3 PULLBACK watch (defer market entry)
+            late_rsi_short = 100.0 - BREAKOUT_LATE_RSI
+            late_chase = (
+                (burst_dir == "LONG" and rsi >= BREAKOUT_LATE_RSI) or
+                (burst_dir == "SHORT" and rsi <= late_rsi_short)
+            )
+
+            trade_class = None
+            if TRADE_CLASS_ROUTER and not late_chase:
+                if _sl_cooldown_active(coin):
+                    continue
+                trade_class = classify_burst_trade_class(
+                    burst_dir=burst_dir,
+                    price=price,
+                    burst_vol=float(burst_vol_live),
+                    rsi=rsi,
+                    trend=trend,
+                    ema_cross_4h=ema_cross_4h,
+                    in_allowlist=in_allowlist,
+                    ind=ind,
+                )
+                if not trade_class:
+                    continue
+                cap = (TREND_CLASS_MAX_PER_DAY if trade_class == "TREND_BREAKOUT"
+                       else SCALP_CLASS_MAX_PER_DAY)
+                if _class_daily_count(coin, trade_class) >= cap:
+                    continue
+                sl_mult = _CLASS_MODE_PARAMS[trade_class]["sl_mult"]
+                tp_mult = _CLASS_MODE_PARAMS[trade_class]["tp_mult"]
+                mode_hint = trade_class
+                atr_sl, atr_tp = _class_sizing_atrs(trade_class, ind, burst_source)
+                if not atr_sl or not atr_tp:
+                    continue
+            else:
                 if tier_info["mode_hint"] == "BREAKOUT_PROBE":
                     if not PROBE_TRADE_ENABLED:
-                        continue  # probe mode disabled → skip untested/thin coins
+                        continue
                     if _probes_today_for_coin(coin) >= PROBE_DAILY_CAP_PER_COIN:
-                        continue  # already probed today
-
+                        continue
                 sl_mult = tier_info["sl_mult"]
                 tp_mult = tier_info["tp_mult"]
-                risk_pct_override = tier_info["risk_pct"]
                 mode_hint = tier_info["mode_hint"]
+                atr_sl = atr_tp = sizing_atr
+                trade_class = "PULLBACK_REENTRY" if late_chase else mode_hint
 
-                entry_b = round(price, 6)
-                if burst_dir == "LONG":
-                    sl_b = round(entry_b - sl_mult * atr, 6)
-                    tp_b = round(entry_b + tp_mult * atr, 6)
-                else:
-                    sl_b = round(entry_b + sl_mult * atr, 6)
-                    tp_b = round(entry_b - tp_mult * atr, 6)
-                pos_b = calc_position_size(entry_b, sl_b, balance,
-                                            risk_pct_override=risk_pct_override)
-                signals.append({
-                    "coin": coin, "symbol": symbol, "direction": burst_dir,
-                    "strength": "EXPLOSIVE", "mode_hint": mode_hint,
-                    "tier": tier_info["tier"],
-                    "tier_reason": tier_info["reason"],
-                    "in_allowlist": in_allowlist,
-                    "entry": entry_b, "sl": sl_b, "tp": tp_b,
-                    "sl_pct": round(abs(entry_b - sl_b) / entry_b * 100, 2),
-                    "tp_pct": round(abs(tp_b - entry_b) / entry_b * 100, 2),
-                    "atr": round(atr, 6), "rsi": round(rsi, 1),
-                    "rsi_prev": round(rsi_prev, 1), "rsi_delta": round(rsi_delta, 1),
-                    "ema20": round(ema_fast, 6), "ema50": round(ema_slow, 6),
-                    "ema_gap_pct": round(ema_gap_pct, 3),
-                    "ema_cross_4h": ema_cross_4h,
-                    "vol_ratio": round(vol_ratio, 2),
-                    "trend": trend,
-                    "rr_ratio": round(tp_mult / sl_mult, 2),
-                    "position_usd": pos_b["position_usd"], "qty": pos_b["qty"],
-                    "risk_usd": pos_b["risk_usd"], "risk_pct": pos_b["risk_pct"],
-                    "burst_range_atr": ind.get("last_bar_range_atr"),
-                    "burst_vol_ratio": ind.get("last_bar_vol_ratio"),
-                    "atr_pct": round(atr_pct, 2),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "status": "pending_review",
-                })
-                continue  # explosive entry takes priority — skip EMA-cross detection this cycle
+            risk_pct_override = tier_info["risk_pct"]
+            entry_b = round(price, 6)
+            if burst_dir == "LONG":
+                sl_b = round(entry_b - sl_mult * atr_sl, 6)
+                tp_b = round(entry_b + tp_mult * atr_tp, 6)
+            else:
+                sl_b = round(entry_b + sl_mult * atr_sl, 6)
+                tp_b = round(entry_b - tp_mult * atr_tp, 6)
+            pos_b = calc_position_size(entry_b, sl_b, balance,
+                                        risk_pct_override=risk_pct_override)
+
+            burst_draft = {
+                "coin": coin, "symbol": symbol, "direction": burst_dir,
+                "strength": "EXPLOSIVE", "mode_hint": mode_hint,
+                "trade_class": trade_class,
+                "tier": tier_info["tier"],
+                "tier_reason": tier_info["reason"],
+                "in_allowlist": in_allowlist,
+                "entry": entry_b, "sl": sl_b, "tp": tp_b,
+                "sl_pct": round(abs(entry_b - sl_b) / entry_b * 100, 2),
+                "tp_pct": round(abs(tp_b - entry_b) / entry_b * 100, 2),
+                "atr": round(atr_sl, 6), "atr_sl": round(atr_sl, 6),
+                "atr_tp": round(atr_tp, 6),
+                "rsi": round(rsi, 1),
+                "rsi_prev": round(rsi_prev, 1), "rsi_delta": round(rsi_delta, 1),
+                "ema20": round(ema_fast, 6), "ema50": round(ema_slow, 6),
+                "ema_gap_pct": round(ema_gap_pct, 3),
+                "ema_cross_4h": ema_cross_4h,
+                "vol_ratio": round(vol_ratio, 2),
+                "trend": trend,
+                "rr_ratio": round(tp_mult / sl_mult, 2),
+                "position_usd": pos_b["position_usd"], "qty": pos_b["qty"],
+                "risk_usd": pos_b["risk_usd"], "risk_pct": pos_b["risk_pct"],
+                "burst_range_atr": burst_range_atr,
+                "burst_vol_ratio": burst_vol_ratio,
+                "burst_source": burst_source,
+                "atr_pct": round(atr_pct, 2),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "pending_review",
+            }
+            if late_chase:
+                register_pullback_watch(
+                    burst_draft,
+                    f"late chase defer: RSI {rsi:.1f} (threshold {BREAKOUT_LATE_RSI})",
+                    late_chase=True,
+                )
+                continue
+
+            signals.append(burst_draft)
+            continue  # explosive entry takes priority — skip EMA-cross detection this cycle
 
         # Standard EMA-cross signals: gate on allowlist (skip off-allowlist here)
         if not in_allowlist:
@@ -1775,7 +2101,8 @@ def rule_based_review(signal: dict, indicators: dict, active_count: int) -> dict
       - 4h EMA strongly opposes signal AND EMA gap > 3% (hard trend conflict only)
 
     Mode classification (determines SL/TP multipliers and timeout):
-      - BREAKOUT: mode_hint in (BREAKOUT, BREAKOUT_OFFLIST, BREAKOUT_PROBE, PULLBACK_REENTRY)
+      - BREAKOUT: mode_hint in (BREAKOUT, BREAKOUT_OFFLIST, BREAKOUT_PROBE, PULLBACK_REENTRY,
+        SCALP_BURST, TREND_BREAKOUT)
       - SWING:    direction aligns with 4h EMA trend
       - SCALP:    direction opposes 4h EMA (counter-trend, tight params)
       - QUICK:    4h neutral or unknown
@@ -1820,7 +2147,8 @@ def rule_based_review(signal: dict, indicators: dict, active_count: int) -> dict
                                   active_count, mode_hint, ema_cross_4h, direction)
 
     # ── CONFIRM — classify mode ────────────────────────────────────────────
-    if mode_hint in ("BREAKOUT", "BREAKOUT_OFFLIST", "BREAKOUT_PROBE", "PULLBACK_REENTRY"):
+    if mode_hint in ("BREAKOUT", "BREAKOUT_OFFLIST", "BREAKOUT_PROBE", "PULLBACK_REENTRY",
+                     "SCALP_BURST", "TREND_BREAKOUT"):
         mode = mode_hint  # preserve specific breakout mode for executor logic
     elif direction == "LONG":
         if ema_cross_4h == "BULLISH":
@@ -1851,6 +2179,8 @@ _MODE_PARAMS = {
     "BREAKOUT_OFFLIST": {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  3.0},
     "BREAKOUT_PROBE":   {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  3.0},
     "PULLBACK_REENTRY": {"sl_mult": 0.5, "tp_mult": 2.5, "timeout_h":  4.0},
+    "SCALP_BURST":      {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  3.0},
+    "TREND_BREAKOUT":   {"sl_mult": 0.6, "tp_mult": 2.0, "timeout_h":  6.0},
 }
 
 
@@ -2290,14 +2620,15 @@ def run_once():
                     tp_mult = review.get("tp_mult", ATR_TP_MULT)
                     timeout_h = review.get("timeout_h", 12.0)
 
-                    atr_v = best.get("atr", 0)
-                    if atr_v > 0 and (sl_mult != ATR_SL_MULT or tp_mult != ATR_TP_MULT):
+                    atr_sl = best.get("atr_sl") or best.get("atr", 0)
+                    atr_tp = best.get("atr_tp") or best.get("atr", 0)
+                    if atr_sl > 0 and atr_tp > 0:
                         if best["direction"] == "LONG":
-                            new_sl = best["entry"] - sl_mult * atr_v
-                            new_tp = best["entry"] + tp_mult * atr_v
+                            new_sl = best["entry"] - sl_mult * atr_sl
+                            new_tp = best["entry"] + tp_mult * atr_tp
                         else:
-                            new_sl = best["entry"] + sl_mult * atr_v
-                            new_tp = best["entry"] - tp_mult * atr_v
+                            new_sl = best["entry"] + sl_mult * atr_sl
+                            new_tp = best["entry"] - tp_mult * atr_tp
                         best["sl"] = round(new_sl, 8)
                         best["tp"] = round(new_tp, 8)
                         best["sl_pct"] = round(abs(new_sl - best["entry"]) / best["entry"] * 100, 3)
@@ -2319,6 +2650,10 @@ def run_once():
                     best["tp_mult"] = tp_mult
                     best["timeout_h"] = timeout_h
                     best["timeout_at"] = timeout_at
+
+                    tc = best.get("trade_class")
+                    if TRADE_CLASS_ROUTER and tc in ("SCALP_BURST", "TREND_BREAKOUT", "PULLBACK_REENTRY"):
+                        _bump_class_daily(coin_key, tc)
 
                     states = trading_state.get("states", {})
                     if coin_key not in states:
@@ -2563,6 +2898,22 @@ def daemon_loop():
               f"| SL={PULLBACK_SL_ATR_MULT}xATR | TP={PULLBACK_TP_ATR_MULT}xATR")
     else:
         print(f"[daemon] PULLBACK RE-ENTRY: OFF (set PULLBACK_REENTRY=1 to enable)")
+    if ULTRA_BURST_ENABLED:
+        print(f"[daemon] MTF BURST: ULTRA_5M ON (range>={ULTRA_BURST_RANGE_ATR}x vol>={ULTRA_BURST_VOL_RATIO}x) "
+              f"| FAST_15M={'ON' if FAST_BURST_ENABLED else 'OFF'} "
+              f"| 4H+1H filter={'ON' if MTF_BURST_FILTER_1H else 'OFF'} "
+              f"| 15M confirm={'ON' if MTF_CONFIRM_15M else 'OFF'} "
+              f"| lateRSI={BREAKOUT_LATE_RSI}")
+    elif FAST_BURST_ENABLED:
+        print(f"[daemon] FAST BURST 15M: ON | range>={FAST_BURST_RANGE_ATR}x | vol>={FAST_BURST_VOL_RATIO}x "
+              f"| lateRSI={BREAKOUT_LATE_RSI}")
+    if TRADE_CLASS_ROUTER:
+        print(f"[daemon] TRADE-CLASS ROUTER: ON | SCALP_BURST (5m/5m SL/TP, cap {SCALP_CLASS_MAX_PER_DAY}/day) "
+              f"| TREND_BREAKOUT (5m SL / 1h TP, cap {TREND_CLASS_MAX_PER_DAY}/day) "
+              f"| PULLBACK_REENTRY (late RSI defer) | vol_trend>={TREND_CLASS_VOL_MIN}x "
+              f"| bounce_skip={CLASS_BOUNCE_PCT}% | SL_cooldown={CLASS_SL_COOLDOWN_H}h")
+    else:
+        print(f"[daemon] TRADE-CLASS ROUTER: OFF (set TRADE_CLASS_ROUTER=1 to enable)")
     if DOWNTREND_SHORT_ENABLED:
         print(f"[daemon] DOWNTREND CONTINUATION SHORT: ON | risk={DT_SHORT_RISK_PCT}% "
               f"| SL={DT_SHORT_SL_ATR_MULT}xATR | TP={DT_SHORT_TP_ATR_MULT}xATR "
