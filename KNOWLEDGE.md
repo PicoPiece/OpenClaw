@@ -1,7 +1,7 @@
 # OpenClaw Knowledge Base
 
 **Ground truth for the OpenClaw AI bot. Updated when system changes.**
-Last updated: 2026-06-02
+Last updated: 2026-06-08
 
 ---
 
@@ -23,7 +23,67 @@ Owner: Sư (1 user).
 4. Reserve (Spot USDT) — emergency capital + opportunity buffer.
 
 Capital flow: Salary → Reserve → top up other layers based on monthly review.
-Profit flow: Futures profit → reinvest into Grid + Reserve. 1st of month split.
+Profit flow (Jun 2026+): Futures is primary engine while grids closed. On milestone
+hit → **Profit Withdrawal Cycle** (see SECTION:PROFIT_WITHDRAWAL_CYCLE). Monthly
+split (`monthly_profit_split.py`) still runs for routine bookkeeping.
+
+---
+
+## SECTION:PROFIT_WITHDRAWAL_CYCLE
+
+**Purpose:** When the futures engine proves +EV live, bank gains into diversified
+real-world assets instead of 100% compound. Protects survival income (Cursor, food)
+and reduces single-point-of-failure on one futures wallet.
+
+**Trigger:** Milestone on **Futures wallet balance** (Binance USDⓈ-M), NOT sim PnL.
+Must pass gates before executing (see below).
+
+### Milestone M1 (user proposal, 2026-06-08)
+
+| Field | Value |
+|-------|-------|
+| Start baseline | $300 futures working capital |
+| Target balance | $500 (+$200 / +67%) |
+| Action | Reallocate **entire $500** at milestone |
+
+| Bucket | Amount | % of $500 | Purpose |
+|--------|--------|-----------|---------|
+| DCA coin | $100 | 20% | Cold crypto stack (BTC/ETH DCA, Earn or spot) |
+| Vàng vật chất | $100 | 20% | Physical gold — inflation hedge, off-exchange |
+| Chứng khoán | $100 | 20% | Equities — decorrelate from crypto |
+| Futures reinvest | $200 | 40% | New working capital for OpenClaw engine |
+
+After M1: futures wallet resets to **$200** (not $300). Engine keeps running smaller
+until M2. External buckets are **withdrawn** — not counted in `PORTFOLIO_BALANCE`.
+
+### Gates (MUST pass before executing M1)
+
+1. Balance ≥ $500 on Binance Futures for **≥ 3 consecutive days** (not one lucky day)
+2. Auto-only net PnL ≥ +$150 over rolling 30d (`source=auto`, exclude manual)
+3. Profit factor ≥ 1.3 and ≥ 30 closed auto trades in last 30d
+4. No Risk Guardian pause in last 14d
+5. User explicit confirm (Telegram or manual) — bot NEVER auto-withdraws
+
+### Process
+
+1. `python3 profit_withdrawal_cycle.py` — check gates + print proposal
+2. User withdraws USDT from Futures → Spot → bank/broker/gold dealer manually
+3. User runs allocation per table; update `data/profit_withdrawal_cycle.json`
+4. Reset `executor_state.json` `starting_balance` to new futures baseline ($200)
+5. Log in `decisions.db` / `profit_splits` for audit trail
+
+### Future milestones (draft — tune after M1 live)
+
+| ID | Target futures bal | Reinvest to futures | External split |
+|----|-------------------|---------------------|----------------|
+| M2 | $400 (from $200) | $350 | $50 DCA + $50 gold/stock |
+| M3 | $700 | $500 | remainder diversified |
+
+Config file: `data/profit_withdrawal_cycle.json` (milestones + execution log).
+
+**Philosophy:** Futures engine = **income generator**, not **sole store of wealth**.
+Compound while proving edge; **harvest** at milestones into assets that pay for life
+(Cursor, food) and survive a futures drawdown.
 
 ---
 
@@ -362,6 +422,17 @@ Top lessons (chronological, key learnings from real failures):
       `TREND_CLASS_MAX_PER_DAY=1`.
     - Caveat: router raises max DD in sim ($277→$475); live has fewer trades + fees.
 
+17. **Profit Withdrawal Cycle — harvest at milestone, don't 100% compound (June 2026)**
+    - Context: grid closed, futures = sole income engine. User needs cash for life +
+      Cursor; 100% compound risks losing everything in one bad streak.
+    - M1 proposal: $300 → $500 milestone → split $500 as $100 DCA + $100 gold +
+      $100 stocks + $200 back to futures. Takes $300 off exchange into real assets.
+    - Gates required: 3d sustained balance, auto PF≥1.3, user confirm. Bot never
+      auto-withdraws.
+    - Trade-off: futures drops $300→$200 after M1 (slower compounding) but survival
+      secured via diversified $300. Better than blowing $500 on one bad month.
+    - See SECTION:PROFIT_WITHDRAWAL_CYCLE + `profit_withdrawal_cycle.py`.
+
 14. **Late breakout entry ≠ edge — ALLO probe win was luck (June 2026)**
     - Symptom: ALLO LONG BREAKOUT_PROBE hit TP +$15, but entry was risky —
       RSI 86.9, entered after a +100% multi-day pump, signal at 10:44 UTC on
@@ -458,7 +529,8 @@ Weekly routine:
 
 Monthly routine (1st of month):
 - Strategy review (`monthly_strategy_review.py`)
-- Profit/withdrawal split (`monthly_profit_split.py`)
+- Profit/withdrawal split (`monthly_profit_split.py`) — routine monthly
+- **Profit Withdrawal Cycle** (`profit_withdrawal_cycle.py`) — milestone harvest
 - Capital tier scaling proposal (`capital_scaling.py`)
 
 Anytime user can:
@@ -480,6 +552,7 @@ Key state files (all in `data/` unless noted):
 - `regime_drift_state.json` — Shield 2 state
 - `decisions.db` — SQLite of all LLM decisions (signal review)
 - `deepseek_cost_state.json` — DeepSeek API spend tracking
+- `profit_withdrawal_cycle.json` — milestone harvest config + execution log
 - `pending_signal.json` — latest signal awaiting LLM review
 - `pullback_watch.json` — coins flagged for pullback re-entry monitoring
 - `telegram_memory.json` — bot conversation memory (this file's purpose)
