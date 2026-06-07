@@ -187,10 +187,13 @@ def evaluate(es: dict, ts: dict) -> dict:
     dd_pct = max(0.0, (starting - current_balance) / starting * 100)
     active = sum(1 for s in (ts.get("states") or {}).values() if s.get("state") == "ACTIVE")
 
+    pause_daily = os.environ.get("RISK_GUARDIAN_DAILY_PAUSE", "1").lower() in ("1", "true", "yes")
+    pause_cb = os.environ.get("RISK_GUARDIAN_CB_PAUSE", "1").lower() in ("1", "true", "yes")
+
     actions, warnings = [], []
-    if daily_pnl <= -action_daily:
+    if pause_daily and dynamic_limit > 0 and daily_pnl <= -action_daily:
         actions.append(f"Daily loss ${daily_pnl:.2f} >= ${action_daily:.0f} (80% of ${dynamic_limit:.0f} limit)")
-    if consec >= ACTION_CONSEC_LOSSES:
+    if pause_cb and consec >= ACTION_CONSEC_LOSSES:
         actions.append(f"Consecutive losses {consec} >= {ACTION_CONSEC_LOSSES}")
     if dd_pct > ACTION_DD_PCT:
         actions.append(f"Drawdown {dd_pct:.2f}% > {ACTION_DD_PCT}% (catastrophic)")

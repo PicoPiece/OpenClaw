@@ -103,7 +103,7 @@ VOL_STRONG_RATIO = 2.0  # threshold for "strong volume" override on SHORT
 
 # --- Portfolio Risk Management ---
 PORTFOLIO_BALANCE = float(os.environ.get("PORTFOLIO_BALANCE", "1000"))
-RISK_PER_TRADE_PCT = 3.0      # max 3% of portfolio risked per trade (raised 2026-05-05 after 12d/13t observation, WR 69%)
+RISK_PER_TRADE_PCT = float(os.environ.get("RISK_PER_TRADE_PCT", "3.0"))
 MAX_PORTFOLIO_RISK_PCT = 12.0  # max 12% total open risk across all positions (raised to keep 4 concurrent slots)
 
 # --- Signal quality filters (per backtest v6: +24.65R lift) ---

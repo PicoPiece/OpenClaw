@@ -11,9 +11,12 @@ Compares 60d:
 
 Usage:
     python3 backtest_trade_class.py [days]
+    python3 backtest_trade_class.py 30 --equity-only          # compound vs fixed equity
+    python3 backtest_trade_class.py 30 --equity-only --risk 3.0 --cycle-sec 30
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -55,10 +58,11 @@ BOUNCE_PCT = 2.0                 # block SHORT if bounced this much off 1h low
 
 # USD simulation (mirrors live .env risk tiers)
 PORTFOLIO_USD = 300.0            # ~futures wallet; effective sizing base
-RISK_PCT_ALLOWLIST = 3.0         # RISK_PER_TRADE_PCT
+RISK_PCT_ALLOWLIST = 3.0         # RISK_PER_TRADE_PCT (override via --risk)
 RISK_PCT_OFFLIST_TREND = 1.5       # BREAKOUT_RISK_PCT
 RISK_PCT_OFFLIST_SCALP = 1.0     # PROBE_RISK_PCT
 FEE_BPS = 4.0                    # ~0.04% taker each side on notional (simplified)
+LIVE_CYCLE_SEC = 30              # min gap between trades in live-like equity sim
 
 
 def _burst_vol_ratio(act: dict, i: int) -> float:
@@ -147,16 +151,109 @@ def _sizing_for_class(trade_class: str) -> dict:
     return TREND_SIZING if trade_class == "TREND" else SCALP_SIZING
 
 
-def _risk_pct(trade_class: str, in_allowlist: bool) -> float:
+def _risk_pct(trade_class: str, in_allowlist: bool, risk_allowlist: float | None = None) -> float:
     if in_allowlist:
-        return RISK_PCT_ALLOWLIST
+        return risk_allowlist if risk_allowlist is not None else RISK_PCT_ALLOWLIST
     if trade_class == "TREND":
         return RISK_PCT_OFFLIST_TREND
     return RISK_PCT_OFFLIST_SCALP
 
 
-def _risk_usd(trade_class: str, in_allowlist: bool, portfolio: float) -> float:
-    return portfolio * _risk_pct(trade_class, in_allowlist) / 100.0
+def _risk_usd(trade_class: str, in_allowlist: bool, portfolio: float,
+              risk_allowlist: float | None = None) -> float:
+    return portfolio * _risk_pct(trade_class, in_allowlist, risk_allowlist) / 100.0
+
+
+def trade_pnl_usd(t: dict, balance: float, *, compound: bool, fixed_base: float,
+                  risk_allowlist: float) -> tuple[float, float]:
+    """Return (net_pnl_usd, risk_usd) for one trade."""
+    base = balance if compound else fixed_base
+    risk = _risk_usd(t["class"], t["in_allowlist"], base, risk_allowlist)
+    if risk <= 0:
+        return 0.0, 0.0
+    gross = t["r"] * risk
+    fee = _fee_usd(risk, t["r"])
+    return gross - fee, risk
+
+
+def filter_cycle(trades: list[dict], cycle_sec: int = LIVE_CYCLE_SEC) -> list[dict]:
+    """Keep first signal per cycle_sec window (live takes signals[0] each poll)."""
+    if cycle_sec <= 0:
+        return list(trades)
+    gap_ms = cycle_sec * 1000
+    sorted_t = sorted(trades, key=lambda x: x["ts"])
+    out: list[dict] = []
+    last_ts = -(10 ** 15)
+    for t in sorted_t:
+        if t["ts"] - last_ts >= gap_ms:
+            out.append(t)
+            last_ts = t["ts"]
+    return out
+
+
+def simulate_equity(
+    trades: list[dict],
+    *,
+    compound: bool,
+    risk_allowlist: float,
+    start_balance: float = PORTFOLIO_USD,
+    cycle_sec: int = LIVE_CYCLE_SEC,
+) -> dict:
+    """Walk trades chronologically; size from wallet (compound) or fixed base."""
+    subset = filter_cycle(trades, cycle_sec) if cycle_sec > 0 else sorted(trades, key=lambda x: x["ts"])
+    if not subset:
+        return {"n": 0}
+
+    balance = start_balance
+    peak = start_balance
+    min_bal = start_balance
+    max_dd_pct = 0.0
+    by_day: dict[str, dict] = {}
+
+    for t in subset:
+        day = _day_key(t["ts"])
+        if day not in by_day:
+            by_day[day] = {"start": balance, "pnl": 0.0, "n": 0, "end": balance}
+        pnl, risk_usd = trade_pnl_usd(
+            t, balance, compound=compound, fixed_base=start_balance, risk_allowlist=risk_allowlist,
+        )
+        balance += pnl
+        by_day[day]["pnl"] += pnl
+        by_day[day]["n"] += 1
+        by_day[day]["end"] = balance
+        peak = max(peak, balance)
+        dd_pct = (peak - balance) / peak * 100 if peak > 0 else 0.0
+        max_dd_pct = max(max_dd_pct, dd_pct)
+        min_bal = min(min_bal, balance)
+
+    worst_day = min(by_day.items(), key=lambda x: x[1]["pnl"])
+    best_day = max(by_day.items(), key=lambda x: x[1]["pnl"])
+    net = balance - start_balance
+
+    return {
+        "n": len(subset),
+        "compound": compound,
+        "risk_allowlist": risk_allowlist,
+        "cycle_sec": cycle_sec,
+        "start": start_balance,
+        "end": round(balance, 2),
+        "net": round(net, 2),
+        "return_pct": round(net / start_balance * 100, 1),
+        "min_balance": round(min_bal, 2),
+        "min_pct_from_start": round((min_bal - start_balance) / start_balance * 100, 1),
+        "max_dd_pct": round(max_dd_pct, 1),
+        "blown": min_bal <= 0,
+        "worst_day": worst_day[0],
+        "worst_day_pnl": round(worst_day[1]["pnl"], 2),
+        "worst_day_start": round(worst_day[1]["start"], 2),
+        "worst_day_end": round(worst_day[1]["end"], 2),
+        "best_day": best_day[0],
+        "best_day_pnl": round(best_day[1]["pnl"], 2),
+        "risk_first": round(start_balance * risk_allowlist / 100, 2),
+        "risk_last": round(balance * risk_allowlist / 100, 2) if compound else round(
+            start_balance * risk_allowlist / 100, 2),
+        "by_day": by_day,
+    }
 
 
 def _fee_usd(risk_usd: float, r_net: float) -> float:
@@ -375,6 +472,7 @@ def backtest_coin(symbol: str, days: int, mode: str, cache: dict) -> list[dict]:
             "r": round(result["r"], 3),
             "bars": result["bars"],
             "in_allowlist": coin.upper() in ALLOWLIST,
+            "ts": ts,
         })
 
     return trades
@@ -429,6 +527,50 @@ def run_mode(name: str, mode: str, days: int, cache: dict) -> dict:
     }
 
 
+def _print_equity_row(label: str, s: dict) -> None:
+    if not s or s.get("n", 0) == 0:
+        print(f"  {label:<36} | no trades")
+        return
+    blown = "YES" if s["blown"] else "no"
+    sizing = "compound" if s["compound"] else f"fixed ${s['start']:.0f}"
+    print(f"  {label:<36} | N={s['n']:>4} end=${s['end']:>10,.0f} ({s['return_pct']:+.0f}%) "
+          f"min=${s['min_balance']:>7,.0f} ({s['min_pct_from_start']:+.0f}%) "
+          f"maxDD={s['max_dd_pct']:>4.1f}% blow={blown}")
+    print(f"  {'':36}   risk/trade ${s['risk_first']:.2f}→${s['risk_last']:.2f} ({sizing}) "
+          f"| worst {s['worst_day']} ${s['worst_day_pnl']:+.0f} "
+          f"(bal ${s['worst_day_start']:,.0f}→${s['worst_day_end']:,.0f})")
+
+
+def run_equity_report(trades: list[dict], days: int, cycle_sec: int = LIVE_CYCLE_SEC) -> None:
+    """Compare fixed vs compound equity at multiple risk tiers (router trades only)."""
+    print(f"\n=== EQUITY SIMULATION — ROUTER {days}d, start ${PORTFOLIO_USD:.0f} ===")
+    print(f"  Live-like: 1 signal / {cycle_sec}s | no daily-loss / no circuit-breaker")
+    print(f"  Compound = risk %% × current wallet (matches live get_portfolio_balance)\n")
+    print(f"  {'Scenario':<36} | Summary")
+    print(f"  {'-'*36}-+-{'-'*70}")
+
+    rows = []
+    for risk in (1.0, 1.5, 3.0):
+        for compound in (False, True):
+            label = f"{'compound' if compound else 'fixed':>8} {risk:.1f}% allowlist"
+            s = simulate_equity(trades, compound=compound, risk_allowlist=risk, cycle_sec=cycle_sec)
+            _print_equity_row(label, s)
+            rows.append((risk, compound, s))
+
+    print("\n  Risk tier guidance (compound, live-like cycle):")
+    c15 = next(s for r, c, s in rows if r == 1.5 and c)
+    c30 = next(s for r, c, s in rows if r == 3.0 and c)
+    if c15.get("n") and c30.get("n"):
+        print(f"    1.5%: min ${c15['min_balance']:.0f} ({c15['min_pct_from_start']:+.0f}%), "
+              f"maxDD {c15['max_dd_pct']:.0f}% from peak")
+        print(f"    3.0%: min ${c30['min_balance']:.0f} ({c30['min_pct_from_start']:+.0f}%), "
+              f"maxDD {c30['max_dd_pct']:.0f}% from peak")
+        if c30["min_pct_from_start"] < -20 or c30["max_dd_pct"] > 50:
+            print("    → 3% compound: drawdown quá sâu trên sim — không khuyến nghị với ~$300")
+        if c15["min_pct_from_start"] >= -15 and c15["max_dd_pct"] <= 45:
+            print("    → 1.5% compound: cân bằng tốt giữa growth và floor — phù hợp live hiện tại")
+
+
 def _print_pnl_block(pnl: dict, indent: str = "  ") -> None:
     if not pnl or pnl.get("n", 0) == 0:
         return
@@ -449,14 +591,48 @@ def _print_pnl_block(pnl: dict, indent: str = "  ") -> None:
                   f"avgW ${cs['avg_win']:+.2f} avgL ${cs['avg_loss']:+.2f})")
 
 
+def _collect_router_trades(days: int, cache: dict) -> list[dict]:
+    trades: list[dict] = []
+    for coin in COINS:
+        sym = coin + "USDT"
+        try:
+            trades.extend(backtest_coin(sym, days, "router", cache))
+        except Exception as exc:
+            print(f"  [warn] {sym}: {exc}")
+    return trades
+
+
 def main():
-    days = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+    global RISK_PCT_ALLOWLIST
+
+    ap = argparse.ArgumentParser(description="Trade-class router backtest")
+    ap.add_argument("days", nargs="?", type=int, default=60, help="Lookback days (default 60)")
+    ap.add_argument("--equity-only", action="store_true",
+                    help="Skip R-mode comparison; run equity sim on ROUTER only")
+    ap.add_argument("--risk", type=float, default=None,
+                    help="Allowlist risk %% for fixed PnL block (default 3.0)")
+    ap.add_argument("--cycle-sec", type=int, default=LIVE_CYCLE_SEC,
+                    help=f"Seconds between trades in equity sim (default {LIVE_CYCLE_SEC})")
+    args = ap.parse_args()
+    days = args.days
+    if args.risk is not None:
+        RISK_PCT_ALLOWLIST = args.risk
+
+    cache: dict = {}
+
+    if args.equity_only:
+        trades = _collect_router_trades(days, cache)
+        print(f"Router signals: {len(trades)} raw | "
+              f"{len(filter_cycle(trades, args.cycle_sec))} @ {args.cycle_sec}s cycle")
+        run_equity_report(trades, days, cycle_sec=args.cycle_sec)
+        return
+
     print(f"=== Trade-Class Router Backtest — {days}d, {len(COINS)} coins ===")
     print(f"  Entry: 5m MTF (0.7 range, 1.6 vol, 4H+1H+15m confirm)")
     print(f"  SCALP: SL/TP 5m ATR, 3h timeout | TREND: SL 5m / TP 1h ATR, 6h timeout")
-    print(f"  Router: rule-based (no LLM) | SL-cooldown 4h | cap 2 scalp + 1 trend/day/coin\n")
+    print(f"  Router: rule-based (no LLM) | SL-cooldown 4h | cap 2 scalp + 1 trend/day/coin")
+    print(f"  Fixed PnL block: ${PORTFOLIO_USD:.0f} wallet, {RISK_PCT_ALLOWLIST:.1f}% allowlist risk\n")
 
-    cache: dict = {}
     results = []
     for name, mode in MODES.items():
         print(f"--- {name} ---")
@@ -464,6 +640,10 @@ def main():
         _print_pnl_block(r.get("pnl", {}))
         results.append(r)
         print()
+
+    router = next((r for r in results if r["name"] == "B_ROUTER_2CLASS"), None)
+    if router and router.get("trades"):
+        run_equity_report(router["trades"], days, cycle_sec=args.cycle_sec)
 
     viable = [r for r in results if r["n"] >= 20]
     if not viable:

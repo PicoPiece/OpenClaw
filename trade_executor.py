@@ -489,12 +489,12 @@ def check_safety(executor_state: dict, executor: BinanceExecutor) -> tuple[bool,
             executor_state["consecutive_losses"] = 0
 
     daily_limit = float(cfg("DAILY_LOSS_LIMIT", str(DEFAULT_DAILY_LOSS_LIMIT)))
-    if executor_state.get("daily_pnl", 0) <= -daily_limit:
+    if daily_limit > 0 and executor_state.get("daily_pnl", 0) <= -daily_limit:
         return False, f"Daily loss limit hit: ${executor_state['daily_pnl']:.2f} / -${daily_limit:.2f}"
 
     consecutive = executor_state.get("consecutive_losses", 0)
     max_consecutive = int(cfg("CIRCUIT_BREAKER_MAX", str(DEFAULT_CIRCUIT_BREAKER)))
-    if consecutive >= max_consecutive:
+    if max_consecutive > 0 and consecutive >= max_consecutive:
         pause_until = datetime.now(timezone.utc) + timedelta(hours=24)
         executor_state["paused_until"] = pause_until.isoformat()
         save_executor_state(executor_state)
